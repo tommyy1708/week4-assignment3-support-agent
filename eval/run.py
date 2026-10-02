@@ -27,7 +27,7 @@ from eval.checks import contains, event_order_violations, percentile
 from eval.driver import ROOT, RUNS_DIR, WEB_URL, cli_turn, run_log, step, terminal, tool_pairs, web_turn
 
 load_dotenv(ROOT / ".env")
-from mem0 import AsyncMemoryClient  # noqa: E402  (reads MEM0_API_KEY)
+from support import memory  # noqa: E402  (after .env is loaded)
 
 GOLD = ROOT / "eval" / "gold"
 REPORT = ROOT / "reports" / "eval.json"
@@ -61,15 +61,11 @@ def orders_snapshot() -> str:
         cwd=ROOT, check=True, capture_output=True, text=True).stdout
 
 
-async def clear_memories(mem0: AsyncMemoryClient, user: str) -> None:
-    """Delete a user's memories and wait until search really comes back empty."""
-    await mem0.delete_all(user_id=user)
-    for _ in range(30):
-        found = await mem0.search("delivery contact preferences home", filters={"user_id": user}, top_k=1, threshold=0)
-        if not (found.get("results") if isinstance(found, dict) else found):
-            return
-        await asyncio.sleep(2)
-    raise RuntimeError(f"Mem0 still holds memories for {user} after delete")
+async def clear_memories(user: str) -> None:
+    """Delete a user's memories (self-hosted Mem0 deletes synchronously) and check none are left."""
+    await memory.clear(user)
+    if await memory.recall(user, "delivery contact preferences"):
+        raise RuntimeError(f"Mem0 still holds memories for {user} after delete")
 
 
 def archive_old_runs() -> None:
@@ -113,7 +109,7 @@ async def run_set(client, name: str) -> list[dict]:
     return out
 
 
-async def run_memory(client, mem0: AsyncMemoryClient) -> list[dict]:
+async def run_memory(client) -> list[dict]:
     """For each pair: clear the user's memories, plant, wait >= T-MEM-WAIT, ask (EVALS §3.7)."""
     by_user: dict[str, list[dict]] = {}
     for pair in load("memory"):
@@ -122,7 +118,7 @@ async def run_memory(client, mem0: AsyncMemoryClient) -> list[dict]:
     async def one_user(pairs: list[dict]) -> list[dict]:
         turns = []
         for pair in pairs:
-            await clear_memories(mem0, pair["user"])
+            await clear_memories(pair["user"])
             plant = await run_item(client, "memory", pair, pair["plant"])
             planted_at = time.monotonic()
             await asyncio.sleep(max(0.0, T_MEM_WAIT_S - (time.monotonic() - planted_at)))
@@ -351,8 +347,7 @@ async def main() -> int:
 
     say("Reset: database, Mem0 for every seeded user, old run logs archived")
     reset_db()
-    mem0 = AsyncMemoryClient()
-    await asyncio.gather(*(clear_memories(mem0, u) for u in USERS))
+    await asyncio.gather(*(clear_memories(u) for u in USERS))
     archive_old_runs()
 
     turns: list[dict] = []
@@ -382,7 +377,7 @@ async def main() -> int:
             turns += await run_set(client, name)
             if name == "action":
                 mutated = orders_snapshot() != before
-        turns += await run_memory(client, mem0)
+        turns += await run_memory(client)
 
     say("Waiting for span export, then reading Phoenix")
     await asyncio.sleep(10)

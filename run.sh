@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Starts, resets and checks the support desk's services, in dependency order.
-# Order: Postgres, MCP Toolbox, Security Judge (A2A), Data Masker (A2A), Phoenix.
+# Order: Postgres + Qdrant, MCP Toolbox, Security Judge (A2A), Data Masker (A2A), Phoenix.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -25,6 +25,20 @@ db_status() {
   local health
   health=$(docker inspect -f '{{.State.Health.Status}}' support-db 2>/dev/null || echo "not running")
   echo "postgres  :5434  $health"
+}
+
+qdrant_up() { curl -sf "http://127.0.0.1:6333/readyz" >/dev/null 2>&1; }
+
+qdrant_status() {
+  if qdrant_up; then echo "qdrant    :6333  ok"; else echo "qdrant    :6333  down"; fi
+}
+
+# Postgres (shop data) and Qdrant (Mem0's vector store) run in Docker.
+start_stores() {
+  docker compose up -d --wait db qdrant
+  db_status
+  for _ in $(seq 1 30); do qdrant_up && break; sleep 1; done
+  qdrant_status
 }
 
 toolbox_up() { curl -sf "http://127.0.0.1:$TOOLBOX_PORT/" >/dev/null 2>&1; }
@@ -119,19 +133,18 @@ stop_phoenix() { pkill -f -- "phoenix serve" 2>/dev/null || true; }
 case "${1:-}" in
   start)
     require_docker
-    docker compose up -d --wait db
-    db_status
+    start_stores
     start_toolbox
     start_judge
     start_masker
     start_phoenix
     ;;
-  reset)  # resets the database only; traces are kept
+  reset)  # resets the database only; memories and traces are kept
     require_docker
     stop_toolbox
-    docker compose down -v
-    docker compose up -d --wait db
-    db_status
+    docker compose rm -sf db
+    docker volume rm -f support-desk_pgdata >/dev/null
+    start_stores
     start_toolbox
     start_judge
     start_masker
@@ -148,6 +161,7 @@ case "${1:-}" in
   status)
     require_docker
     db_status
+    qdrant_status
     toolbox_status
     judge_status
     masker_status
@@ -155,8 +169,7 @@ case "${1:-}" in
     ;;
   web)  # start every service, then the web UI in the foreground (Ctrl+C stops only the web app)
     require_docker
-    docker compose up -d --wait db
-    db_status
+    start_stores
     start_toolbox
     start_judge
     start_masker

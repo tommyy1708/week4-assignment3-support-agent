@@ -6,6 +6,7 @@ import os
 
 from google.adk.agents import LlmAgent
 from google.adk.models.lite_llm import LiteLlm
+from google.genai import types
 from toolbox_core import ToolboxClient
 
 TOOLBOX_URL = os.getenv("TOOLBOX_URL", "http://127.0.0.1:5001")
@@ -23,7 +24,8 @@ what they ordered and paid, deliveries, returns, cancellations and account detai
 Tools:
 - get-order-status: one of this customer's orders, by order number.
 - find-customer-orders: all of this customer's orders, newest first. Use it for history,
-  "my last order", or when they describe an order by product instead of number.
+  "my last order", or when they describe an order by product instead of number. When they
+  name a product, always look it up with this tool; never ask them for an order number.
 - action-log: record a change the customer asked for (cancel, return, new address,
   a preference, a profile change). It does NOT change the order; a person acts on it later.
 
@@ -68,4 +70,7 @@ async def build_agent(client: ToolboxClient, customer: dict) -> LlmAgent:
         model=LiteLlm(model=MODEL),
         instruction=INSTRUCTION.format(full_name=customer["full_name"]),
         tools=tools,
+        # Temperature 0: the same request should take the same path every time. Run 1 of the second
+        # eval had O08 refuse to look up an order by product and A06 ask to confirm a found order.
+        generate_content_config=types.GenerateContentConfig(temperature=0),
     )

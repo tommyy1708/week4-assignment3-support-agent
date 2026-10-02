@@ -1,0 +1,24 @@
+# Python 3.12. Install: python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
+# opentelemetry-* are pinned to the range google-adk declares; openai < 3 for litellm; google-api-core
+# pinned to a release that accepts opentelemetry-api 1.42 (a2a-sdk pulls it in).
+a2a-sdk==1.2.1
+arize-phoenix==20.19.0
+fastapi==0.141.1
+fastembed==0.8.1
+google-adk==2.10.0
+google-api-core==2.34.0
+httpx==0.28.1
+litellm==1.103.2
+mem0ai==2.2.1
+openai==2.54.0
+openinference-instrumentation-litellm==0.1.48
+openinference-semantic-conventions==0.1.41
+opentelemetry-api==1.42.1
+opentelemetry-exporter-otlp-proto-http==1.42.1
+opentelemetry-sdk==1.42.1
+python-dotenv==1.2.4
+PyYAML==6.0.3
+qdrant-client==1.19.1
+ruff==0.16.10
+toolbox-core==1.4.0
+uvicorn==0.54.0

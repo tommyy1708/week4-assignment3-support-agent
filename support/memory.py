@@ -1,26 +1,47 @@
 """Memory as pipeline steps, not a tool (R-1, R-6): recall runs before the agent and save runs
 after the Masker, every passing turn. The model decides what to say, never whether the system
-remembers (SPEC §11 R-2)."""
+remembers (SPEC §11 R-2).
 
-from mem0 import AsyncMemoryClient
+Self-hosted Mem0 (open source): Qdrant in Docker holds the vectors, FastEmbed embeds locally,
+and the fact-extraction LLM goes through LiteLLM to OpenRouter. The Mem0 cloud free tier allows
+1 000 searches a billing period and ran out in the middle of an eval run (2026-10-02)."""
 
-# THRESHOLDS §4. T-MEM-MINSCORE lowered from 0.25 to 0.15 with evidence (2026-10-02): Mem0's
-# combined score (semantic + BM25 + entity) put diana's "back door" memory at 0.156-0.252 for four
-# related questions and 0.086-0.126 for six unrelated ones. The recall gate T-MEM-RECALL is unchanged.
+from pathlib import Path
+
+from mem0 import AsyncMemory
+
+ROOT = Path(__file__).resolve().parent.parent
+QDRANT_URL = "http://127.0.0.1:6333"
+
+# THRESHOLDS §4. T-MEM-MINSCORE history, each change with evidence from the same "back door" memory
+# against 4 related and 6 unrelated questions; the recall gate T-MEM-RECALL never moved:
+#   0.25 -> 0.15  Mem0 cloud combined score: related 0.156-0.252, unrelated 0.086-0.126
+#   0.15 -> 0.20  self-hosted Mem0 + all-MiniLM-L6-v2: related 0.239-0.306, unrelated 0.009-0.146
 T_MEM_TOPK = 5
-T_MEM_MINSCORE = 0.15
+T_MEM_MINSCORE = 0.20
 T_MEM_MAXCHARS = 500
 
 HEADER = "Relevant memories about this customer (from Mem0):"
 
-_client: AsyncMemoryClient | None = None
+CONFIG = {
+    "vector_store": {"provider": "qdrant", "config": {
+        "host": "127.0.0.1", "port": 6333, "collection_name": "support_desk_memories",
+        "embedding_model_dims": 384}},
+    "embedder": {"provider": "fastembed", "config": {"model": "sentence-transformers/all-MiniLM-L6-v2"}},
+    # Fact extraction runs inside the save step, so a lighter model keeps passing turns fast.
+    "llm": {"provider": "litellm", "config": {"model": "openrouter/google/gemini-2.5-flash-lite", "temperature": 0}},
+    "history_db_path": str(ROOT / "mem0_data" / "history.db"),
+}
+
+_memory: AsyncMemory | None = None
 
 
-def _mem0() -> AsyncMemoryClient:
-    global _client
-    if _client is None:
-        _client = AsyncMemoryClient()  # reads MEM0_API_KEY
-    return _client
+def _mem0() -> AsyncMemory:
+    global _memory
+    if _memory is None:
+        (ROOT / "mem0_data").mkdir(exist_ok=True)
+        _memory = AsyncMemory.from_config(CONFIG)
+    return _memory
 
 
 async def recall(user: str, message: str) -> list[dict]:
@@ -54,7 +75,14 @@ def with_memories(message: str, candidates: list[dict]) -> str:
 
 
 async def save(user: str, message: str) -> str:
-    """Save only what the customer said, never the agent's reply (R-4). Mem0 extracts facts
-    asynchronously, so this returns PENDING and the memory is searchable some seconds later."""
+    """Save only what the customer said, never the agent's reply (R-4). Self-hosted Mem0 extracts
+    facts in this call, so the memory is searchable as soon as it returns."""
     response = await _mem0().add([{"role": "user", "content": message}], user_id=user)
-    return str(response.get("status", "accepted")) if isinstance(response, dict) else "accepted"
+    results = response.get("results", []) if isinstance(response, dict) else []
+    events = [r.get("event", "ADD") for r in results]
+    return f"{len(results)} fact(s): {', '.join(events)}" if results else "no new facts"
+
+
+async def clear(user: str) -> None:
+    """Delete every memory of one user (the eval runner calls this before each memory pair)."""
+    await _mem0().delete_all(user_id=user)

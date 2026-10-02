@@ -1,5 +1,7 @@
-# Postgres for the support desk. Init scripts run only on an empty volume,
-# so `./run.sh reset` (down -v, then up) is how a run starts from a known state.
+# Postgres for the shop and Qdrant for Mem0's memories. Postgres init scripts run only on an empty
+# volume, so `./run.sh reset` (drop the pgdata volume, then up) is how a run starts from a known
+# state; memories in Qdrant are cleared per user by the eval runner, not by reset.
+name: support-desk
 services:
   db:
     image: postgres:16
@@ -24,5 +26,15 @@ services:
       timeout: 3s
       retries: 30
 
+  # Vector store for self-hosted Mem0 (the cloud free tier's 1 000 searches ran out mid-eval).
+  qdrant:
+    image: qdrant/qdrant:v1.15.4
+    container_name: support-qdrant
+    ports:
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - qdrantdata:/qdrant/storage
+
 volumes:
   pgdata:
+  qdrantdata:

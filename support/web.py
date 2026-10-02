@@ -120,11 +120,12 @@ async def health():
         checks["db"] = "ok"
     except Exception as e:
         checks["db"] = f"{type(e).__name__}: {e}"
-    try:
-        await memory.recall("health-check@invalid", "health")
+    try:  # Mem0's vector store; /health is polled, so it checks liveness rather than running a search
+        async with httpx.AsyncClient(timeout=5) as client:
+            (await client.get(f"{memory.QDRANT_URL}/readyz")).raise_for_status()
         checks["mem0"] = "ok"
-    except Exception as e:
-        checks["mem0"] = f"{type(e).__name__}: {e}"
+    except httpx.HTTPError as e:
+        checks["mem0"] = f"qdrant: {type(e).__name__}: {e}"
     ok = all(v == "ok" for k, v in checks.items() if k != "model")
     return JSONResponse({"status": "ok" if ok else "degraded"} | checks, status_code=200 if ok else 503)
 
