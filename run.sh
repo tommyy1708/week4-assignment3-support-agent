@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Starts, resets and checks the support desk's services, in dependency order.
-# Stage 6: Postgres, MCP Toolbox, Security Judge (A2A), Phoenix. Stage 8 adds the Masker before Phoenix.
+# Order: Postgres, MCP Toolbox, Security Judge (A2A), Data Masker (A2A), Phoenix.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -8,6 +8,7 @@ TOOLBOX_VERSION=1.13.1
 TOOLBOX_PORT=5001   # 5000 is taken by macOS AirPlay Receiver
 TOOLBOX_MATCH="--config mcp_toolbox/tools.yaml"
 JUDGE_PORT=10002
+MASKER_PORT=10003
 PHOENIX_PORT=6006
 # Phoenix keeps traces in a SQLite file here, so they survive restarts (O-1, SPEC §11 R-10).
 PHOENIX_DIR="$PWD/phoenix_data"
@@ -71,6 +72,27 @@ stop_judge() {
   for _ in $(seq 1 20); do judge_up || return 0; sleep 0.5; done
 }
 
+masker_up() { curl -sf "http://127.0.0.1:$MASKER_PORT/.well-known/agent-card.json" >/dev/null 2>&1; }
+
+masker_status() {
+  if masker_up; then echo "masker    :$MASKER_PORT ok"; else echo "masker    :$MASKER_PORT down"; fi
+}
+
+# The Data Masker is the second A2A service the security team owns (K-1).
+start_masker() {
+  if masker_up; then masker_status; return; fi
+  MASKER_PORT="$MASKER_PORT" nohup .venv/bin/python -m guards.masker > logs/masker.log 2>&1 &
+  for _ in $(seq 1 60); do
+    masker_up && { masker_status; return; }
+    sleep 1
+  done
+  echo "masker failed to start; last log lines:" >&2
+  tail -20 logs/masker.log >&2
+  exit 1
+}
+
+stop_masker() { pkill -f -- "-m guards.masker" 2>/dev/null || true; }
+
 phoenix_up() { curl -sf "http://127.0.0.1:$PHOENIX_PORT/healthz" >/dev/null 2>&1; }
 
 phoenix_status() {
@@ -101,6 +123,7 @@ case "${1:-}" in
     db_status
     start_toolbox
     start_judge
+    start_masker
     start_phoenix
     ;;
   reset)  # resets the database only; traces are kept
@@ -111,10 +134,12 @@ case "${1:-}" in
     db_status
     start_toolbox
     start_judge
+    start_masker
     start_phoenix
     ;;
   stop)
     stop_phoenix
+    stop_masker
     stop_judge
     stop_toolbox
     require_docker
@@ -125,6 +150,7 @@ case "${1:-}" in
     db_status
     toolbox_status
     judge_status
+    masker_status
     phoenix_status
     ;;
   stop-judge)  # for the fail-loud check: send a message while the Judge is down

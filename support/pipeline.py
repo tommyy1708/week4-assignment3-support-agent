@@ -1,15 +1,17 @@
 """One support turn as a stream of events (SPEC §7.1). The CLI and the web server only render
 this stream; no pipeline logic lives in either (P-1).
 
-Each turn runs inside one root span, agent.turn (O-2). Stage 7: sanitize -> judge -> guardrail -> agent.
+Each turn runs inside one root span, agent.turn (O-2).
+Fixed order (P-2): sanitize -> judge -> guardrail -> recall -> agent -> mask -> save.
 A guard that blocks ends the turn at once (P-3); a guard that fails ends it with an error (P-4).
-Memory and the Masker are added in stage 8."""
+Every step after the agent runs only on turns that were not blocked, so a blocked message is
+never remembered."""
 
 import asyncio
 import json
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -23,7 +25,9 @@ from toolbox_core import ToolboxClient
 
 from guards import guardrail
 from guards.judge.client import judge
+from guards.masker.client import mask_reply
 from guards.sanitizer import sanitize
+from support import memory
 from support.agent import MODEL, build_agent
 from support.telemetry import trace_url
 from support.tool_info import tool_info
@@ -63,6 +67,10 @@ class GuardResult:
     detail: str
     tokens_in: int = 0
     tokens_out: int = 0
+    output: str | None = None  # text the step hands on: the Masker's masked reply, recall's agent input
+    event_extra: dict = field(default_factory=dict)       # extra fields on the step event (recall's memories)
+    log_extra: dict = field(default_factory=dict)         # extra fields in the run log's step entry
+    span_attributes: dict = field(default_factory=dict)
 
 
 async def _check_sanitize(message: str) -> GuardResult:
@@ -86,16 +94,59 @@ class _Guard:
     span: str
     kind: str
     check: Callable[[str], Awaitable[GuardResult]]
+    span_kind: str = OpenInferenceSpanKindValues.GUARDRAIL.value
     blocked_reply: str = BLOCKED_REPLY
+    error_note: str = "Your message could not be checked, so it was not answered."
 
 
-# Fixed order (P-2). Stage 8 adds recall after these.
+# The inbound guards, in order (P-2). Recall, mask and save are built per turn below.
 GUARDS = (
     _Guard("sanitize", "Sanitizer", "security.sanitize", "in-process", _check_sanitize),
     _Guard("judge", "A2A Security Judge", "security.a2a_judge", "A2A", _check_judge),
     _Guard("guardrail", "Guardrail", "guardrail.check", "in-process", _check_guardrail,
            blocked_reply=guardrail.BLOCKED_REPLY),
 )
+
+
+def _mask_guard(turn: "_Turn", user_message: str) -> _Guard:
+    """The outbound guard (K-1..K-3): never blocks, returns the reply with other people's PII masked."""
+    async def check(text: str) -> GuardResult:
+        masked, detail = await mask_reply(text, turn.user, user_message)
+        return GuardResult(True, detail, output=masked)
+    return _Guard("mask", "A2A Data Masker", "security.a2a_mask", "A2A", check,
+                  error_note="The reply could not be checked for personal data, so it was not sent.")
+
+
+def _recall_step(turn: "_Turn") -> _Guard:
+    """Recall is a step, not a tool (R-1): search Mem0, report every candidate, hand the agent its input."""
+    async def check(message: str) -> GuardResult:
+        candidates = await memory.recall(turn.user, message)
+        inserted = sum(c["inserted"] for c in candidates)
+        attributes = {}
+        for i, c in enumerate(candidates):  # RETRIEVER span: each document's content and score
+            prefix = f"retrieval.documents.{i}.document"
+            attributes[f"{prefix}.content"] = c["memory"]
+            attributes[f"{prefix}.score"] = c["score"]
+            attributes[f"{prefix}.metadata"] = json.dumps({"inserted": c["inserted"], "reason": c["reason"]})
+        return GuardResult(
+            True, f"{inserted} inserted, {len(candidates) - inserted} skipped",
+            output=memory.with_memories(message, candidates),
+            event_extra={"memories": candidates},
+            log_extra={"inserted": inserted, "skipped": len(candidates) - inserted},
+            span_attributes=attributes)
+    return _Guard("recall", "Mem0 recall", "memory.recall", "Python fn", check,
+                  span_kind=OpenInferenceSpanKindValues.RETRIEVER.value,
+                  error_note="Memory recall failed, so the message was not answered.")
+
+
+def _save_step(turn: "_Turn") -> _Guard:
+    """Save is a step too: only the customer's own message, never the reply (R-4)."""
+    async def check(message: str) -> GuardResult:
+        status = await memory.save(turn.user, message)
+        return GuardResult(True, f"saved the customer's message ({status})")
+    return _Guard("save", "Mem0 save", "memory.save", "Python fn", check,
+                  span_kind=OpenInferenceSpanKindValues.TOOL.value,
+                  error_note="The memory could not be saved, so the turn was stopped.")
 
 
 class _Cap(Exception):
@@ -162,12 +213,19 @@ async def _turn_events(sess: SupportSession, turn: _Turn, message: str) -> Async
         if outcome["stop"]:
             return
 
+    outcome = {"stop": False}
+    async for event in _guard_events(turn, _recall_step(turn), message, outcome):
+        yield event
+    if outcome["stop"]:
+        return
+    agent_input = outcome["output"]
+
     yield {"type": "stage", "key": "agent", "label": "Support agent"}
     started = time.monotonic()
     result: dict = {}
     terminated, response = "done", ""
     try:
-        async for event in _agent_events(sess, turn, message, result):
+        async for event in _agent_events(sess, turn, agent_input, result):
             yield event
         response = result.get("response", "")
     except (_Cap, TimeoutError) as cap:
@@ -191,26 +249,43 @@ async def _turn_events(sess: SupportSession, turn: _Turn, message: str) -> Async
            "detail": f"{turn.llm_calls} model calls, {len(turn.tool_calls)} tool calls",
            "ms": ms, "span": "invoke_agent support_agent", "kind": "in-process"}
 
+    outcome = {"stop": False}
+    async for event in _guard_events(turn, _mask_guard(turn, message), response, outcome):
+        yield event
+    if outcome["stop"]:
+        return
+    response = outcome["output"]
+
+    outcome = {"stop": False}
+    async for event in _guard_events(turn, _save_step(turn), message, outcome):
+        yield event
+    if outcome["stop"]:
+        return
+
     turn.write_log(terminated)  # before the terminal event (P-5)
     yield {"type": "final", "blocked": False, "blocked_at": None, "response": response,
            "terminated": terminated, "wall_clock_ms": turn.ms(), "tokens": turn.tokens}
 
 
-async def _guard_events(turn: _Turn, guard: _Guard, message: str, outcome: dict) -> AsyncIterator[dict]:
-    """One guard step in its own GUARDRAIL span. Sets outcome["stop"] when the turn must end."""
+async def _guard_events(turn: _Turn, guard: _Guard, text: str, outcome: dict) -> AsyncIterator[dict]:
+    """One pipeline step (a guard, recall, mask or save) in its own span, given `text`. Sets
+    outcome["stop"] when the turn must end, and outcome["output"] to the text the step hands on.
+    Any exception is an error event, never a pass (P-4)."""
     yield {"type": "stage", "key": guard.key, "label": guard.label}
     started = time.monotonic()
     error = None
-    attributes = {SpanAttributes.OPENINFERENCE_SPAN_KIND: OpenInferenceSpanKindValues.GUARDRAIL.value,
-                  SpanAttributes.INPUT_VALUE: message}
+    attributes = {SpanAttributes.OPENINFERENCE_SPAN_KIND: guard.span_kind, SpanAttributes.INPUT_VALUE: text}
     with _tracer.start_as_current_span(guard.span, attributes=attributes) as span:
         try:
-            result = await guard.check(message)
+            result = await guard.check(text)
             passed, detail = result.passed, result.detail
+            outcome["output"] = result.output
             turn.tokens["in"] += result.tokens_in  # T-BUD-TOKENS counts every LLM layer
             turn.tokens["out"] += result.tokens_out
-            span.set_attribute(SpanAttributes.OUTPUT_VALUE, detail)
+            span.set_attribute(SpanAttributes.OUTPUT_VALUE, result.output if result.output is not None else detail)
+            span.set_attribute("guard.detail", detail)
             span.set_attribute("guard.passed", passed)
+            span.set_attributes(result.span_attributes)
         except Exception as e:  # unreachable, timeout, unparseable: never treated as a pass (P-4)
             error = str(e)
             span.record_exception(e)
@@ -222,13 +297,13 @@ async def _guard_events(turn: _Turn, guard: _Guard, message: str, outcome: dict)
         turn.steps.append({"key": guard.key, "status": "error", "ms": ms})
         turn.write_log("error")
         yield {"type": "error", "step": guard.key, "status": 502, "terminated": "error",
-               "error": f"{error}. Your message could not be checked, so it was not answered."}
+               "error": f"{error}. {guard.error_note}"}
         return
 
     status = "passed" if passed else "blocked"
-    turn.steps.append({"key": guard.key, "status": status, "ms": ms})
+    turn.steps.append({"key": guard.key, "status": status, "ms": ms} | result.log_extra)
     yield {"type": "step", "key": guard.key, "status": status, "detail": detail, "ms": ms,
-           "span": guard.span, "kind": guard.kind}
+           "span": guard.span, "kind": guard.kind} | result.event_extra
     if not passed:  # a block ends the turn: nothing after it runs, including save (P-3)
         outcome["stop"] = True
         turn.write_log("blocked", blocked_at=guard.key)

@@ -40,6 +40,9 @@ def render(ev: dict) -> None:
         print(f"{mark} {ev['key']}{status}  {ev['ms']} ms")
         if ev.get("detail"):
             print(f"  └ {ev['detail']}")
+        for m in ev.get("memories", []):
+            mark = "✓" if m["inserted"] else f"✗ {m['reason']}"
+            print(f"    · {m['score']:.2f}  {m['memory'][:70]!r}  {mark}")
     elif kind == "llm":
         print(f"◆ llm  {ev['decision']}  {ev['ms']} ms · {ev['tokens_in']}→{ev['tokens_out']} tok")
     elif kind == "tool_call":
