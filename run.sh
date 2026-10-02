@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Starts, resets and checks the support desk's services, in dependency order.
-# Stage 5: Postgres, MCP Toolbox, Phoenix. Later stages add Judge and Masker before Phoenix.
+# Stage 6: Postgres, MCP Toolbox, Security Judge (A2A), Phoenix. Stage 8 adds the Masker before Phoenix.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 TOOLBOX_VERSION=1.13.1
 TOOLBOX_PORT=5001   # 5000 is taken by macOS AirPlay Receiver
 TOOLBOX_MATCH="--config mcp_toolbox/tools.yaml"
+JUDGE_PORT=10002
 PHOENIX_PORT=6006
 # Phoenix keeps traces in a SQLite file here, so they survive restarts (O-1, SPEC §11 R-10).
 PHOENIX_DIR="$PWD/phoenix_data"
@@ -46,6 +47,30 @@ start_toolbox() {
 
 stop_toolbox() { pkill -f -- "$TOOLBOX_MATCH" 2>/dev/null || true; }
 
+judge_up() { curl -sf "http://127.0.0.1:$JUDGE_PORT/.well-known/agent-card.json" >/dev/null 2>&1; }
+
+judge_status() {
+  if judge_up; then echo "judge     :$JUDGE_PORT ok"; else echo "judge     :$JUDGE_PORT down"; fi
+}
+
+# The Security Judge is its own A2A service, owned apart from the product (J-1).
+start_judge() {
+  if judge_up; then judge_status; return; fi
+  JUDGE_PORT="$JUDGE_PORT" nohup .venv/bin/python -m guards.judge > logs/judge.log 2>&1 &
+  for _ in $(seq 1 60); do
+    judge_up && { judge_status; return; }
+    sleep 1
+  done
+  echo "judge failed to start; last log lines:" >&2
+  tail -20 logs/judge.log >&2
+  exit 1
+}
+
+stop_judge() {
+  pkill -f -- "-m guards.judge" 2>/dev/null || true
+  for _ in $(seq 1 20); do judge_up || return 0; sleep 0.5; done
+}
+
 phoenix_up() { curl -sf "http://127.0.0.1:$PHOENIX_PORT/healthz" >/dev/null 2>&1; }
 
 phoenix_status() {
@@ -75,6 +100,7 @@ case "${1:-}" in
     docker compose up -d --wait db
     db_status
     start_toolbox
+    start_judge
     start_phoenix
     ;;
   reset)  # resets the database only; traces are kept
@@ -84,10 +110,12 @@ case "${1:-}" in
     docker compose up -d --wait db
     db_status
     start_toolbox
+    start_judge
     start_phoenix
     ;;
   stop)
     stop_phoenix
+    stop_judge
     stop_toolbox
     require_docker
     docker compose stop
@@ -96,10 +124,15 @@ case "${1:-}" in
     require_docker
     db_status
     toolbox_status
+    judge_status
     phoenix_status
     ;;
+  stop-judge)  # for the fail-loud check: send a message while the Judge is down
+    stop_judge
+    judge_status
+    ;;
   *)
-    echo "usage: ./run.sh {start|reset|stop|status}" >&2
+    echo "usage: ./run.sh {start|reset|stop|status|stop-judge}" >&2
     exit 1
     ;;
 esac

@@ -1,8 +1,9 @@
 """One support turn as a stream of events (SPEC §7.1). The CLI and the web server only render
 this stream; no pipeline logic lives in either (P-1).
 
-Each turn runs inside one root span, agent.turn (O-2). Stage 5: the agent step only; guards and
-memory are added in stages 6 to 8."""
+Each turn runs inside one root span, agent.turn (O-2). Stage 6: sanitize -> judge -> agent.
+A guard that blocks ends the turn at once (P-3); a guard that fails ends it with an error (P-4).
+The Guardrail, memory and the Masker are added in stages 7 and 8."""
 
 import asyncio
 import json
@@ -10,7 +11,7 @@ import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
@@ -20,6 +21,8 @@ from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 from toolbox_core import ToolboxClient
 
+from guards.judge.client import judge
+from guards.sanitizer import sanitize
 from support.agent import MODEL, build_agent
 from support.telemetry import trace_url
 from support.tool_info import tool_info
@@ -31,6 +34,8 @@ RUNS_DIR = Path(__file__).resolve().parent.parent / "runs"
 T_BUD_TOOLS = 6
 T_BUD_TOKENS = 30_000
 T_BUD_WALL_S = 30
+
+BLOCKED_REPLY = "Sorry, I can't help with that request."
 
 _tracer = trace.get_tracer("support.pipeline")
 
@@ -49,6 +54,31 @@ async def open_session(client: ToolboxClient, customer: dict) -> SupportSession:
     session = await sessions.create_session(app_name=APP_NAME, user_id=customer["email"])
     runner = Runner(app_name=APP_NAME, agent=agent, session_service=sessions)
     return SupportSession(customer, runner, session.id)
+
+
+async def _check_sanitize(message: str) -> tuple[bool, str]:
+    return sanitize(message)
+
+
+async def _check_judge(message: str) -> tuple[bool, str]:
+    verdict = await judge(message)
+    return verdict.verdict == "allow", f"{verdict.verdict}: {verdict.reason}"
+
+
+@dataclass(frozen=True)
+class _Guard:
+    key: str
+    label: str
+    span: str
+    kind: str
+    check: Callable[[str], Awaitable[tuple[bool, str]]]  # -> (passed, detail)
+
+
+# Fixed order (P-2). Stages 7-8 add guardrail and recall here.
+GUARDS = (
+    _Guard("sanitize", "Sanitizer", "security.sanitize", "in-process", _check_sanitize),
+    _Guard("judge", "A2A Security Judge", "security.a2a_judge", "A2A", _check_judge),
+)
 
 
 class _Cap(Exception):
@@ -108,6 +138,13 @@ async def run_turn(sess: SupportSession, message: str) -> AsyncIterator[dict]:
 async def _turn_events(sess: SupportSession, turn: _Turn, message: str) -> AsyncIterator[dict]:
     yield {"type": "trace", "turn_id": turn.turn_id, "trace_id": turn.trace_id, "url": trace_url(turn.trace_id)}
 
+    for guard in GUARDS:
+        outcome = {"stop": False}
+        async for event in _guard_events(turn, guard, message, outcome):
+            yield event
+        if outcome["stop"]:
+            return
+
     yield {"type": "stage", "key": "agent", "label": "Support agent"}
     started = time.monotonic()
     result: dict = {}
@@ -140,6 +177,43 @@ async def _turn_events(sess: SupportSession, turn: _Turn, message: str) -> Async
     turn.write_log(terminated)  # before the terminal event (P-5)
     yield {"type": "final", "blocked": False, "blocked_at": None, "response": response,
            "terminated": terminated, "wall_clock_ms": turn.ms(), "tokens": turn.tokens}
+
+
+async def _guard_events(turn: _Turn, guard: _Guard, message: str, outcome: dict) -> AsyncIterator[dict]:
+    """One guard step in its own GUARDRAIL span. Sets outcome["stop"] when the turn must end."""
+    yield {"type": "stage", "key": guard.key, "label": guard.label}
+    started = time.monotonic()
+    error = None
+    attributes = {SpanAttributes.OPENINFERENCE_SPAN_KIND: OpenInferenceSpanKindValues.GUARDRAIL.value,
+                  SpanAttributes.INPUT_VALUE: message}
+    with _tracer.start_as_current_span(guard.span, attributes=attributes) as span:
+        try:
+            passed, detail = await guard.check(message)
+            span.set_attribute(SpanAttributes.OUTPUT_VALUE, detail)
+            span.set_attribute("guard.passed", passed)
+        except Exception as e:  # unreachable, timeout, unparseable: never treated as a pass (P-4)
+            error = str(e)
+            span.record_exception(e)
+            span.set_status(Status(StatusCode.ERROR, error))
+    ms = int((time.monotonic() - started) * 1000)
+
+    if error is not None:
+        outcome["stop"] = True
+        turn.steps.append({"key": guard.key, "status": "error", "ms": ms})
+        turn.write_log("error")
+        yield {"type": "error", "step": guard.key, "status": 502, "terminated": "error",
+               "error": f"{error}. Your message could not be checked, so it was not answered."}
+        return
+
+    status = "passed" if passed else "blocked"
+    turn.steps.append({"key": guard.key, "status": status, "ms": ms})
+    yield {"type": "step", "key": guard.key, "status": status, "detail": detail, "ms": ms,
+           "span": guard.span, "kind": guard.kind}
+    if not passed:  # a block ends the turn: nothing after it runs, including save (P-3)
+        outcome["stop"] = True
+        turn.write_log("blocked", blocked_at=guard.key)
+        yield {"type": "final", "blocked": True, "blocked_at": guard.key, "response": BLOCKED_REPLY,
+               "terminated": "blocked", "wall_clock_ms": turn.ms(), "tokens": turn.tokens}
 
 
 async def _agent_events(sess: SupportSession, turn: _Turn, message: str, result: dict) -> AsyncIterator[dict]:
