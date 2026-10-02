@@ -88,3 +88,26 @@ tools:
   - get-order-status
   - find-customer-orders
   - action-log
+---
+# Login check. Lives in its own toolset, which only the login step loads; the agent never sees it.
+kind: tool
+name: verify-login
+type: postgres-sql
+source: shop-db
+description: Check a customer's email and password. Returns the customer if they match, nothing otherwise.
+parameters:
+  - name: email
+    type: string
+    description: The email the customer typed.
+  - name: password
+    type: string
+    description: The password the customer typed.
+statement: |
+  SELECT email, full_name, is_premium_customer
+  FROM users
+  WHERE email = $1 AND password = $2;
+---
+kind: toolset
+name: auth
+tools:
+  - verify-login
