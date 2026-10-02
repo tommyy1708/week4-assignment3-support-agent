@@ -1,9 +1,9 @@
 """One support turn as a stream of events (SPEC §7.1). The CLI and the web server only render
 this stream; no pipeline logic lives in either (P-1).
 
-Each turn runs inside one root span, agent.turn (O-2). Stage 6: sanitize -> judge -> agent.
+Each turn runs inside one root span, agent.turn (O-2). Stage 7: sanitize -> judge -> guardrail -> agent.
 A guard that blocks ends the turn at once (P-3); a guard that fails ends it with an error (P-4).
-The Guardrail, memory and the Masker are added in stages 7 and 8."""
+Memory and the Masker are added in stage 8."""
 
 import asyncio
 import json
@@ -21,6 +21,7 @@ from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 from toolbox_core import ToolboxClient
 
+from guards import guardrail
 from guards.judge.client import judge
 from guards.sanitizer import sanitize
 from support.agent import MODEL, build_agent
@@ -56,13 +57,26 @@ async def open_session(client: ToolboxClient, customer: dict) -> SupportSession:
     return SupportSession(customer, runner, session.id)
 
 
-async def _check_sanitize(message: str) -> tuple[bool, str]:
-    return sanitize(message)
+@dataclass
+class GuardResult:
+    passed: bool
+    detail: str
+    tokens_in: int = 0
+    tokens_out: int = 0
 
 
-async def _check_judge(message: str) -> tuple[bool, str]:
-    verdict = await judge(message)
-    return verdict.verdict == "allow", f"{verdict.verdict}: {verdict.reason}"
+async def _check_sanitize(message: str) -> GuardResult:
+    return GuardResult(*sanitize(message))
+
+
+async def _check_judge(message: str) -> GuardResult:
+    verdict, tokens_in, tokens_out = await judge(message)
+    return GuardResult(verdict.verdict == "allow", f"{verdict.verdict}: {verdict.reason}", tokens_in, tokens_out)
+
+
+async def _check_guardrail(message: str) -> GuardResult:
+    decision, tokens_in, tokens_out = await guardrail.check(message)
+    return GuardResult(decision.decision == "safe", f"{decision.decision}: {decision.reasoning}", tokens_in, tokens_out)
 
 
 @dataclass(frozen=True)
@@ -71,13 +85,16 @@ class _Guard:
     label: str
     span: str
     kind: str
-    check: Callable[[str], Awaitable[tuple[bool, str]]]  # -> (passed, detail)
+    check: Callable[[str], Awaitable[GuardResult]]
+    blocked_reply: str = BLOCKED_REPLY
 
 
-# Fixed order (P-2). Stages 7-8 add guardrail and recall here.
+# Fixed order (P-2). Stage 8 adds recall after these.
 GUARDS = (
     _Guard("sanitize", "Sanitizer", "security.sanitize", "in-process", _check_sanitize),
     _Guard("judge", "A2A Security Judge", "security.a2a_judge", "A2A", _check_judge),
+    _Guard("guardrail", "Guardrail", "guardrail.check", "in-process", _check_guardrail,
+           blocked_reply=guardrail.BLOCKED_REPLY),
 )
 
 
@@ -188,7 +205,10 @@ async def _guard_events(turn: _Turn, guard: _Guard, message: str, outcome: dict)
                   SpanAttributes.INPUT_VALUE: message}
     with _tracer.start_as_current_span(guard.span, attributes=attributes) as span:
         try:
-            passed, detail = await guard.check(message)
+            result = await guard.check(message)
+            passed, detail = result.passed, result.detail
+            turn.tokens["in"] += result.tokens_in  # T-BUD-TOKENS counts every LLM layer
+            turn.tokens["out"] += result.tokens_out
             span.set_attribute(SpanAttributes.OUTPUT_VALUE, detail)
             span.set_attribute("guard.passed", passed)
         except Exception as e:  # unreachable, timeout, unparseable: never treated as a pass (P-4)
@@ -212,7 +232,7 @@ async def _guard_events(turn: _Turn, guard: _Guard, message: str, outcome: dict)
     if not passed:  # a block ends the turn: nothing after it runs, including save (P-3)
         outcome["stop"] = True
         turn.write_log("blocked", blocked_at=guard.key)
-        yield {"type": "final", "blocked": True, "blocked_at": guard.key, "response": BLOCKED_REPLY,
+        yield {"type": "final", "blocked": True, "blocked_at": guard.key, "response": guard.blocked_reply,
                "terminated": "blocked", "wall_clock_ms": turn.ms(), "tokens": turn.tokens}
 
 

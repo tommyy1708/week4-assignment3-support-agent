@@ -18,7 +18,8 @@ class GuardError(Exception):
     """A guard could not give a verdict. Fail loud: the turn ends with an error (P-4)."""
 
 
-async def judge(message: str) -> Verdict:
+async def judge(message: str) -> tuple[Verdict, int, int]:
+    """Return (verdict, tokens_in, tokens_out); tokens are 0 when the pattern scan decided."""
     payload = {
         "jsonrpc": "2.0", "id": uuid.uuid4().hex, "method": "message/send",
         "params": {"message": {"role": "user", "messageId": uuid.uuid4().hex,
@@ -33,9 +34,11 @@ async def judge(message: str) -> Verdict:
         raise GuardError(f"Security Judge unreachable: {type(e).__name__}: {e}") from e
     if "error" in body:
         raise GuardError(f"Security Judge returned an error: {body['error'].get('message')}")
-    text = _reply_text(body.get("result") or {})
+    result = body.get("result") or {}
+    text = _reply_text(result)
+    usage = (result.get("metadata") or {}).get("adk_usage_metadata") or {}
     try:
-        return parse_verdict(text)
+        return parse_verdict(text), int(usage.get("promptTokenCount", 0)), int(usage.get("candidatesTokenCount", 0))
     except (ValueError, ValidationError) as e:
         raise GuardError(f"Security Judge verdict unparseable: {text[:200]!r}") from e
 
