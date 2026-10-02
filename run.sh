@@ -153,12 +153,23 @@ case "${1:-}" in
     masker_status
     phoenix_status
     ;;
+  web)  # start every service, then the web UI in the foreground (Ctrl+C stops only the web app)
+    require_docker
+    docker compose up -d --wait db
+    db_status
+    start_toolbox
+    start_judge
+    start_masker
+    start_phoenix
+    echo "web UI    http://127.0.0.1:8010"
+    exec .venv/bin/python -m support.web
+    ;;
   stop-judge)  # for the fail-loud check: send a message while the Judge is down
     stop_judge
     judge_status
     ;;
   *)
-    echo "usage: ./run.sh {start|reset|stop|status|stop-judge}" >&2
+    echo "usage: ./run.sh {start|reset|stop|status|web|stop-judge}" >&2
     exit 1
     ;;
 esac

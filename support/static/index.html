@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Support Desk · Ops Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chivo:wght@400;600;800&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Dispatch console: ink background on schematic grid; signal lamps encode step state. */
+:root {
+  --ink: #0d131e; --panel: #131b29; --panel-2: #182234; --line: #26324a; --line-soft: #1d2840;
+  --text: #e6ebf2; --muted: #8592a8; --faint: #4d5a73;
+  --amber: #f2b441; --teal: #39cdb1; --coral: #ff6b5b; --blue: #7ea6ff;
+  --sans: "Chivo", "Avenir Next", "Segoe UI", sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background:
+    radial-gradient(1200px 600px at 85% -10%, rgba(126,166,255,.10), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, rgba(57,205,177,.07), transparent 60%),
+    repeating-linear-gradient(0deg, transparent 0 31px, rgba(255,255,255,.025) 31px 32px),
+    repeating-linear-gradient(90deg, transparent 0 31px, rgba(255,255,255,.025) 31px 32px),
+    var(--ink);
+  color: var(--text); font: 14px/1.5 var(--sans);
+  display: grid; grid-template-rows: auto 1fr;
+}
+button, input { font: inherit; color: inherit; }
+code, .mono { font-family: var(--mono); }
+
+/* ── header ─────────────────────────────────────────── */
+header {
+  display: flex; align-items: center; gap: 24px; padding: 14px 24px;
+  border-bottom: 1px solid var(--line); background: rgba(13,19,30,.85); backdrop-filter: blur(6px);
+}
+.brand { display: flex; align-items: baseline; gap: 10px; }
+.brand b { font-weight: 800; letter-spacing: .02em; font-size: 17px; }
+.brand span { font: 600 11px/1 var(--mono); color: var(--muted); letter-spacing: .14em; text-transform: uppercase; }
+.health { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+.pill { font: 11px/1 var(--mono); padding: 5px 8px 5px 18px; border: 1px solid var(--line); border-radius: 99px; color: var(--muted); position: relative; }
+.pill::before { content: ""; position: absolute; left: 7px; top: 50%; width: 6px; height: 6px; margin-top: -3px; border-radius: 50%; background: var(--faint); }
+.pill.ok::before { background: var(--teal); box-shadow: 0 0 8px var(--teal); }
+.pill.bad { color: var(--coral); border-color: rgba(255,107,91,.4); }
+.pill.bad::before { background: var(--coral); box-shadow: 0 0 8px var(--coral); }
+.who { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; }
+.who b { color: var(--text); font-weight: 600; }
+.ghost { background: none; border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; cursor: pointer; color: var(--muted); }
+.ghost:hover { color: var(--text); border-color: var(--muted); }
+
+/* ── layout ─────────────────────────────────────────── */
+main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(420px, 520px); min-height: 0; }
+.chat { display: grid; grid-template-rows: 1fr auto; min-height: 0; border-right: 1px solid var(--line); }
+.log { overflow-y: auto; padding: 28px clamp(16px, 4vw, 56px); display: flex; flex-direction: column; gap: 18px; }
+.rail { overflow-y: auto; background: rgba(19,27,41,.75); min-height: 0; }
+
+/* ── chat ───────────────────────────────────────────── */
+.empty { margin: auto; max-width: 420px; text-align: center; color: var(--muted); }
+.empty h2 { font-weight: 800; font-size: 26px; color: var(--text); margin: 0 0 8px; letter-spacing: -.01em; }
+.suggest { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 18px; }
+.suggest button { background: var(--panel-2); border: 1px solid var(--line); border-radius: 99px; padding: 6px 12px; cursor: pointer; font-size: 13px; color: var(--text); }
+.suggest button:hover { border-color: var(--blue); }
+.msg { max-width: 72ch; animation: rise .25s ease-out both; }
+.msg.user { align-self: flex-end; background: var(--panel-2); border: 1px solid var(--line); border-radius: 14px 14px 4px 14px; padding: 10px 14px; }
+.msg.agent { align-self: flex-start; padding-left: 16px; border-left: 2px solid var(--teal); }
+.msg.agent.blocked { border-left-color: var(--coral); }
+.msg.agent.error { border-left-color: var(--coral); color: #ffc2bb; }
+.msg.agent.cap { border-left-color: var(--amber); }
+.msg .text { white-space: pre-wrap; }
+.meta { margin-top: 6px; font: 11px/1.4 var(--mono); color: var(--muted); display: flex; gap: 10px; flex-wrap: wrap; }
+.meta a { color: var(--blue); text-decoration: none; }
+.meta a:hover { text-decoration: underline; }
+.badge { font: 600 10px/1 var(--mono); letter-spacing: .1em; text-transform: uppercase; padding: 3px 6px; border-radius: 4px; }
+.badge.blocked, .badge.error { background: rgba(255,107,91,.15); color: var(--coral); }
+.badge.cap { background: rgba(242,180,65,.15); color: var(--amber); }
+.dots span { display: inline-block; width: 6px; height: 6px; margin-right: 4px; border-radius: 50%; background: var(--muted); animation: blink 1s infinite; }
+.dots span:nth-child(2) { animation-delay: .15s; } .dots span:nth-child(3) { animation-delay: .3s; }
+form.composer { display: flex; gap: 10px; padding: 16px clamp(16px, 4vw, 56px) 22px; border-top: 1px solid var(--line); background: rgba(13,19,30,.9); }
+.composer input { flex: 1; min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; outline: none; }
+.composer input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(126,166,255,.15); }
+.primary { background: var(--text); color: var(--ink); border: 0; border-radius: 10px; padding: 0 18px; font-weight: 800; cursor: pointer; }
+.primary:disabled { opacity: .4; cursor: default; }
+
+/* ── rail: architecture ─────────────────────────────── */
+.section-h { display: flex; justify-content: space-between; align-items: baseline; padding: 18px 22px 8px; }
+.section-h h3 { margin: 0; font: 600 11px/1 var(--mono); letter-spacing: .16em; text-transform: uppercase; color: var(--muted); }
+.section-h a, .section-h span { font: 11px/1 var(--mono); color: var(--blue); text-decoration: none; }
+.arch { padding: 0 14px 6px; }
+.arch svg { width: 100%; height: auto; display: block; }
+.node rect { fill: var(--panel-2); stroke: var(--line); stroke-width: 1.2; transition: fill .25s, stroke .25s; }
+.node text { fill: var(--muted); font: 600 11px var(--mono); transition: fill .25s; }
+.node .sub { font: 9px var(--mono); fill: var(--faint); }
+.node.running rect { stroke: var(--amber); fill: rgba(242,180,65,.12); animation: pulse 1s ease-in-out infinite; }
+.node.running text { fill: var(--amber); }
+.node.passed rect { stroke: var(--teal); fill: rgba(57,205,177,.10); }
+.node.passed text { fill: var(--teal); }
+.node.blocked rect, .node.error rect { stroke: var(--coral); fill: rgba(255,107,91,.14); }
+.node.blocked text, .node.error text { fill: var(--coral); }
+.node.error rect { stroke-dasharray: 4 3; }
+.node.skipped { opacity: .3; }
+.edge { stroke: var(--line); stroke-width: 1.4; fill: none; transition: stroke .25s; }
+.edge.active { stroke: var(--amber); stroke-dasharray: 4 4; animation: flow .6s linear infinite; }
+.edge.done { stroke: rgba(57,205,177,.6); }
+.edge.fail { stroke: var(--coral); }
+.lbl { font: 9px var(--mono); fill: var(--faint); }
+.group { fill: none; stroke: var(--line-soft); stroke-dasharray: 3 4; }
+
+/* ── rail: timeline ─────────────────────────────────── */
+.timeline { padding: 0 22px 28px; display: flex; flex-direction: column; gap: 2px; }
+.hint { color: var(--faint); font-size: 13px; padding: 4px 0; }
+.row { display: grid; grid-template-columns: 14px 1fr auto; gap: 4px 10px; padding: 9px 0; border-bottom: 1px solid var(--line-soft); animation: rise .2s ease-out both; }
+.lamp { width: 10px; height: 10px; border-radius: 50%; margin-top: 4px; background: var(--faint); }
+.row.running .lamp { background: var(--amber); box-shadow: 0 0 10px var(--amber); animation: blink 1s infinite; }
+.row.passed .lamp { background: var(--teal); box-shadow: 0 0 8px rgba(57,205,177,.7); }
+.row.blocked .lamp, .row.error .lamp { background: var(--coral); box-shadow: 0 0 10px var(--coral); }
+.row .k { font: 600 13px var(--mono); }
+.row .k small { font-weight: 400; color: var(--faint); margin-left: 8px; }
+.row .ms { font: 12px var(--mono); color: var(--muted); text-align: right; }
+.row .d { grid-column: 2 / 4; color: var(--muted); font-size: 13px; }
+.row .span { grid-column: 2 / 4; font: 10px var(--mono); color: var(--faint); }
+.row.blocked .k, .row.error .k { color: var(--coral); }
+.sub-list { grid-column: 2 / 4; display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
+.llm { font: 11px var(--mono); color: var(--muted); }
+.llm b { color: var(--text); font-weight: 600; }
+.tool { border: 1px solid var(--line); border-radius: 8px; background: rgba(13,19,30,.6); overflow: hidden; }
+.tool-h { display: flex; justify-content: space-between; gap: 8px; padding: 7px 10px; border-bottom: 1px solid var(--line-soft); font: 600 12px var(--mono); color: var(--blue); }
+.tool-h .acc { font-weight: 400; color: var(--faint); }
+.sql { margin: 0; padding: 8px 10px; font: 11px/1.55 var(--mono); color: #b8c3d6; white-space: pre-wrap; word-break: break-word; }
+.sql .v { color: var(--amber); }
+.sql .b { color: var(--teal); }
+.sql .note { color: var(--faint); }
+.tbl { overflow-x: auto; border-top: 1px solid var(--line-soft); }
+table { border-collapse: collapse; width: 100%; font: 11px var(--mono); }
+th, td { text-align: left; padding: 5px 10px; border-bottom: 1px solid var(--line-soft); white-space: nowrap; vertical-align: top; }
+th { color: var(--faint); font-weight: 600; }
+td { color: var(--text); }
+.result-note { padding: 6px 10px; font: 11px var(--mono); color: var(--muted); border-top: 1px solid var(--line-soft); }
+.result-note.err { color: var(--coral); }
+.mem { grid-column: 2 / 4; display: grid; grid-template-columns: 44px 1fr; gap: 3px 10px; margin-top: 6px; font-size: 12px; }
+.mem .score { font: 11px var(--mono); color: var(--muted); position: relative; padding-top: 6px; }
+.mem .bar { position: absolute; left: 0; top: 0; height: 3px; background: var(--teal); border-radius: 2px; }
+.mem .no .bar { background: var(--faint); }
+.mem .txt.no { color: var(--faint); text-decoration: line-through; text-decoration-color: rgba(255,255,255,.2); }
+.mem .why { grid-column: 2; font: 10px var(--mono); color: var(--faint); margin-top: -2px; }
+.summary { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; font: 12px var(--mono); color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px 16px; }
+.summary b { color: var(--text); font-weight: 600; }
+
+/* ── login ──────────────────────────────────────────── */
+.overlay { position: fixed; inset: 0; display: grid; place-items: center; background: rgba(8,12,19,.78); backdrop-filter: blur(3px); z-index: 10; }
+.overlay[hidden] { display: none; }
+.card { width: min(420px, calc(100vw - 32px)); background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 28px; box-shadow: 0 30px 80px rgba(0,0,0,.5); animation: rise .3s ease-out both; }
+.card h2 { margin: 0 0 4px; font-weight: 800; font-size: 22px; }
+.card p { margin: 0 0 18px; color: var(--muted); }
+.card label { display: block; font: 600 11px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); margin: 12px 0 6px; }
+.card input { width: 100%; background: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; outline: none; }
+.card input:focus { border-color: var(--blue); }
+.card .primary { width: 100%; padding: 11px; margin-top: 18px; }
+.card .err { color: var(--coral); font-size: 13px; min-height: 20px; margin-top: 10px; }
+.demo { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line-soft); font: 11px var(--mono); color: var(--faint); }
+.demo button { background: none; border: 0; color: var(--blue); cursor: pointer; padding: 2px 4px; font: inherit; }
+
+@keyframes rise { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@keyframes blink { 50% { opacity: .35; } }
+@keyframes pulse { 50% { fill: rgba(242,180,65,.24); } }
+@keyframes flow { to { stroke-dashoffset: -8; } }
+@media (prefers-reduced-motion: reduce) { *, *::before { animation: none !important; } }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } .rail { border-top: 1px solid var(--line); } .chat { border-right: 0; min-height: 70vh; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><b>Support Desk</b><span>Ops console</span></div>
+  <div class="health" id="health" aria-label="Service health"></div>
+  <div class="who" id="who" hidden><span>Signed in as <b id="who-name"></b></span><button class="ghost" id="logout">Log out</button></div>
+</header>
+
+<main>
+  <section class="chat">
+    <div class="log" id="log">
+      <div class="empty" id="empty">
+        <h2>How can we help?</h2>
+        <div>Every message passes the guards on the right before the agent sees it. Watch each step light up as it runs.</div>
+        <div class="suggest" id="suggest"></div>
+      </div>
+    </div>
+    <form class="composer" id="composer">
+      <input id="message" autocomplete="off" placeholder="Ask about your orders, deliveries or returns…" aria-label="Message">
+      <button class="primary" id="send" type="submit">Send</button>
+    </form>
+  </section>
+
+  <aside class="rail">
+    <div class="section-h"><h3>Live architecture</h3><span id="arch-state">idle</span></div>
+    <div class="arch">
+      <svg viewBox="0 0 440 412" role="img" aria-label="Pipeline: sanitize, judge, guardrail, recall, agent, mask and save, with the Judge and Masker A2A services, the MCP Toolbox and Postgres, Mem0 and Phoenix. Nodes light up as the turn runs.">
+        <defs>
+          <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#4d5a73"/></marker>
+        </defs>
+        <rect class="group" x="148" y="10" width="144" height="350" rx="10"/>
+        <text class="lbl" x="220" y="6" text-anchor="middle">pipeline · one trace</text>
+
+        <!-- pipeline edges -->
+        <line class="edge" id="p-judge" x1="220" y1="50" x2="220" y2="68" marker-end="url(#ah)"/>
+        <line class="edge" id="p-guardrail" x1="220" y1="100" x2="220" y2="118" marker-end="url(#ah)"/>
+        <line class="edge" id="p-recall" x1="220" y1="150" x2="220" y2="168" marker-end="url(#ah)"/>
+        <line class="edge" id="p-agent" x1="220" y1="200" x2="220" y2="218" marker-end="url(#ah)"/>
+        <line class="edge" id="p-mask" x1="220" y1="250" x2="220" y2="268" marker-end="url(#ah)"/>
+        <line class="edge" id="p-save" x1="220" y1="300" x2="220" y2="318" marker-end="url(#ah)"/>
+        <!-- service edges -->
+        <line class="edge" id="e-judge" x1="160" y1="85" x2="126" y2="85" marker-start="url(#ah)" marker-end="url(#ah)"/>
+        <line class="edge" id="e-tool" x1="160" y1="235" x2="126" y2="235" marker-start="url(#ah)" marker-end="url(#ah)"/>
+        <line class="edge" id="e-db" x1="71" y1="216" x2="71" y2="199" marker-end="url(#ah)"/>
+        <line class="edge" id="e-mask" x1="160" y1="285" x2="126" y2="285" marker-start="url(#ah)" marker-end="url(#ah)"/>
+        <line class="edge" id="e-recall" x1="280" y1="185" x2="330" y2="185" marker-start="url(#ah)" marker-end="url(#ah)"/>
+        <line class="edge" id="e-save" x1="280" y1="335" x2="330" y2="335" marker-end="url(#ah)"/>
+        <line class="edge" id="e-llm" x1="280" y1="235" x2="290" y2="235"/>
+        <line class="edge" id="e-trace" x1="220" y1="360" x2="220" y2="372" marker-end="url(#ah)"/>
+        <text class="lbl" x="143" y="80" text-anchor="end">A2A</text>
+        <text class="lbl" x="143" y="230" text-anchor="end">MCP</text>
+        <text class="lbl" x="143" y="280" text-anchor="end">A2A</text>
+        <text class="lbl" x="305" y="180" text-anchor="middle">search</text>
+        <text class="lbl" x="305" y="330" text-anchor="middle">add</text>
+
+        <!-- pipeline steps -->
+        <g class="node" id="n-sanitize"><rect x="160" y="20" width="120" height="30" rx="6"/><text x="220" y="39" text-anchor="middle">sanitize</text></g>
+        <g class="node" id="n-judge"><rect x="160" y="70" width="120" height="30" rx="6"/><text x="220" y="89" text-anchor="middle">judge</text></g>
+        <g class="node" id="n-guardrail"><rect x="160" y="120" width="120" height="30" rx="6"/><text x="220" y="139" text-anchor="middle">guardrail</text></g>
+        <g class="node" id="n-recall"><rect x="160" y="170" width="120" height="30" rx="6"/><text x="220" y="189" text-anchor="middle">recall</text></g>
+        <g class="node" id="n-agent"><rect x="160" y="220" width="120" height="30" rx="6"/><text x="220" y="239" text-anchor="middle">agent</text></g>
+        <g class="node" id="n-mask"><rect x="160" y="270" width="120" height="30" rx="6"/><text x="220" y="289" text-anchor="middle">mask</text></g>
+        <g class="node" id="n-save"><rect x="160" y="320" width="120" height="30" rx="6"/><text x="220" y="339" text-anchor="middle">save</text></g>
+
+        <!-- services -->
+        <g class="node" id="s-judge"><rect x="16" y="66" width="110" height="38" rx="6"/><text x="71" y="83" text-anchor="middle">Judge</text><text class="sub" x="71" y="96" text-anchor="middle">A2A :10002</text></g>
+        <g class="node" id="s-db"><rect x="16" y="161" width="110" height="38" rx="6"/><text x="71" y="178" text-anchor="middle">Postgres</text><text class="sub" x="71" y="191" text-anchor="middle">:5434</text></g>
+        <g class="node" id="s-toolbox"><rect x="16" y="216" width="110" height="38" rx="6"/><text x="71" y="233" text-anchor="middle">MCP Toolbox</text><text class="sub" x="71" y="246" text-anchor="middle">:5001</text></g>
+        <g class="node" id="s-masker"><rect x="16" y="266" width="110" height="38" rx="6"/><text x="71" y="283" text-anchor="middle">Masker</text><text class="sub" x="71" y="296" text-anchor="middle">A2A :10003</text></g>
+        <g class="node" id="s-llm"><rect x="290" y="223" width="40" height="24" rx="12"/><text x="310" y="239" text-anchor="middle">LLM</text></g>
+        <g class="node" id="s-mem0"><rect x="330" y="166" width="94" height="186" rx="8"/><text x="377" y="255" text-anchor="middle">Mem0</text><text class="sub" x="377" y="268" text-anchor="middle">memory</text></g>
+        <g class="node" id="s-phoenix"><rect x="16" y="372" width="408" height="30" rx="6"/><text x="220" y="391" text-anchor="middle">Phoenix · trace</text></g>
+      </svg>
+    </div>
+
+    <div class="section-h"><h3>This turn</h3><a id="trace-link" href="#" target="_blank" rel="noopener" hidden>open trace ↗</a></div>
+    <div class="timeline" id="timeline"><div class="hint">Send a message to see every step: what ran, how long it took, the SQL each tool executed and what memory was used.</div></div>
+  </aside>
+</main>
+
+<div class="overlay" id="login">
+  <form class="card" id="login-form">
+    <h2>Sign in</h2>
+    <p>Demo shop accounts. Passwords are the first name, lower case.</p>
+    <label for="email">Email</label>
+    <input id="email" type="email" autocomplete="username" required>
+    <label for="password">Password</label>
+    <input id="password" type="password" autocomplete="current-password" required>
+    <button class="primary" type="submit">Sign in</button>
+    <div class="err" id="login-err" role="alert"></div>
+    <div class="demo">Try: <span id="demo-users"></span></div>
+  </form>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const ORDER = ["sanitize", "judge", "guardrail", "recall", "agent", "mask", "save"];
+const SERVICES = { judge: ["s-judge", "e-judge"], mask: ["s-masker", "e-mask"], recall: ["s-mem0", "e-recall"], save: ["s-mem0", "e-save"] };
+const DEMO = { alice: "alice.jones@example.com", bob: "bob.smith@techmail.com", diana: "diana.prince@hero.net", george: "george.j@jungle.com", julia: "julia.child@kitchen.com" };
+const SUGGEST = ["What is the status of order 3?", "Where is my last order?", "Where should you leave my packages?", "Cancel order 4 please", "Write me a poem about the stock market"];
+
+let user = null;
+let busy = false;
+
+/* ── health ─────────────────────────────────────────── */
+async function loadHealth() {
+  try {
+    const r = await fetch("/health");
+    const h = await r.json();
+    $("health").innerHTML = ["db", "toolbox", "judge", "masker", "mem0", "phoenix"].map((k) =>
+      `<span class="pill ${h[k] === "ok" ? "ok" : "bad"}" title="${esc(h[k])}">${k}</span>`).join("");
+  } catch { $("health").innerHTML = `<span class="pill bad">server unreachable</span>`; }
+}
+
+/* ── login ──────────────────────────────────────────── */
+function showLogin(msg = "") { $("login").hidden = false; $("login-err").textContent = msg; $("email").focus(); }
+function setUser(u) {
+  user = u;
+  $("who").hidden = !u; $("who-name").textContent = u ? u.full_name : "";
+  try { u ? sessionStorage.setItem("desk-user", JSON.stringify(u)) : sessionStorage.removeItem("desk-user"); } catch {}
+}
+$("demo-users").innerHTML = Object.keys(DEMO).map((n) => `<button type="button" data-n="${n}">${n}</button>`).join(" ");
+$("demo-users").addEventListener("click", (e) => {
+  const n = e.target.dataset.n; if (!n) return;
+  $("email").value = DEMO[n]; $("password").value = n;
+});
+$("login-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const r = await fetch("/api/login", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: $("email").value, password: $("password").value }) });
+  const body = await r.json();
+  if (!r.ok) { $("login-err").textContent = body.error || "Sign-in failed."; return; }
+  setUser(body); $("login").hidden = true; $("message").focus();
+});
+$("logout").addEventListener("click", async () => {
+  if (user) await fetch("/api/logout", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ user_id: user.user_id }) });
+  setUser(null); showLogin();
+});
+
+/* ── architecture lamps ─────────────────────────────── */
+function lamp(id, state) {
+  const el = $(id); if (!el) return;
+  el.classList.remove("running", "passed", "blocked", "error", "skipped", "active", "done", "fail");
+  if (!state) return;
+  if (el.tagName === "line") el.classList.add({ running: "active", passed: "done", blocked: "fail", error: "fail" }[state] || state);
+  else el.classList.add(state);
+}
+function resetArch() {
+  document.querySelectorAll(".arch .node, .arch .edge").forEach((el) => lamp(el.id, null));
+  $("arch-state").textContent = "idle";
+}
+function skipAfter(key) {
+  ORDER.slice(ORDER.indexOf(key) + 1).forEach((k) => { lamp("n-" + k, "skipped"); lamp("p-" + k, null); });
+}
+
+/* ── timeline ───────────────────────────────────────── */
+function row(key, label) {
+  const r = document.createElement("div");
+  r.className = "row running"; r.id = "row-" + key;
+  r.innerHTML = `<div class="lamp"></div><div class="k">${esc(key)}<small>${esc(label)}</small></div><div class="ms">…</div>`;
+  $("timeline").appendChild(r);
+  return r;
+}
+function fillSql(info, args) {
+  // Show the statement with each $n replaced by its value; bound params are marked as bound.
+  return esc(info.statement).replace(/\$(\d+)/g, (m, n) => {
+    const p = info.params[Number(n) - 1];
+    if (p === undefined) return m;
+    const bound = info.bound.includes(p);
+    const val = bound ? `${esc(user?.user_id)} <span class="note">/* bound from session */</span>`
+                      : esc(JSON.stringify(args[p] ?? null));
+    return `<span class="${bound ? "b" : "v"}">${val}</span>`;
+  });
+}
+function table(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return `<div class="result-note">0 rows</div>`;
+  const cols = [...new Set(rows.flatMap((r) => Object.keys(r)))];
+  const cell = (v) => typeof v === "object" && v !== null
+    ? (Array.isArray(v) ? v.map((x) => x.product ? `${x.qty}× ${x.product}` : JSON.stringify(x)).join(", ") : JSON.stringify(v))
+    : String(v ?? "");
+  return `<div class="tbl"><table><thead><tr>${cols.map((c) => `<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>` +
+    rows.map((r) => `<tr>${cols.map((c) => `<td>${esc(cell(r[c]))}</td>`).join("")}</tr>`).join("") + `</tbody></table></div>`;
+}
+
+/* ── event handling (the same stream the CLI renders) ─ */
+let bubble = null;
+function onEvent(ev) {
+  switch (ev.type) {
+    case "trace": {
+      resetArch(); $("timeline").innerHTML = "";
+      lamp("s-phoenix", "running"); lamp("e-trace", "running");
+      $("arch-state").textContent = ev.turn_id;
+      if (ev.url) { $("trace-link").href = ev.url; $("trace-link").hidden = false; }
+      bubble.dataset.trace = ev.url || "";
+      break;
+    }
+    case "stage": {
+      row(ev.key, ev.label);
+      lamp("n-" + ev.key, "running"); lamp("p-" + ev.key, "running");
+      (SERVICES[ev.key] || []).forEach((id) => lamp(id, "running"));
+      break;
+    }
+    case "step": {
+      const r = $("row-" + ev.key);
+      r.className = "row " + ev.status;
+      r.querySelector(".ms").textContent = ev.ms + " ms";
+      r.insertAdjacentHTML("beforeend", `<div class="d">${esc(ev.detail)}</div><div class="span">${esc(ev.span)} · ${esc(ev.kind)}</div>`);
+      if (ev.memories && ev.memories.length) {
+        r.insertAdjacentHTML("beforeend", `<div class="mem">` + ev.memories.map((m) => {
+          const w = Math.min(100, Math.round(m.score * 200));
+          return `<div class="score ${m.inserted ? "" : "no"}"><span class="bar" style="width:${w}%"></span>${m.score.toFixed(2)}</div>` +
+            `<div class="txt ${m.inserted ? "" : "no"}">${esc(m.memory)}</div>` + (m.reason ? `<div class="why">${esc(m.reason)}</div>` : "");
+        }).join("") + `</div>`);
+      }
+      const state = ev.status === "passed" ? "passed" : "blocked";
+      lamp("n-" + ev.key, state); lamp("p-" + ev.key, "passed");
+      (SERVICES[ev.key] || []).forEach((id) => lamp(id, state));
+      if (ev.status === "blocked") skipAfter(ev.key);
+      break;
+    }
+    case "llm": {
+      lamp("s-llm", "running"); lamp("e-llm", "running");
+      setTimeout(() => { lamp("s-llm", "passed"); lamp("e-llm", "passed"); }, 350);
+      agentList().insertAdjacentHTML("beforeend",
+        `<div class="llm">◆ <b>${esc(ev.decision)}</b> · ${ev.ms} ms · ${ev.tokens_in}→${ev.tokens_out} tok</div>`);
+      break;
+    }
+    case "tool_call": {
+      ["s-toolbox", "s-db", "e-tool", "e-db"].forEach((id) => lamp(id, "running"));
+      agentList().insertAdjacentHTML("beforeend",
+        `<div class="tool" id="tool-${ev.id}"><div class="tool-h"><span>⚙ ${esc(ev.name)}</span>` +
+        `<span class="acc">${esc(ev.info.kind)} · ${esc(ev.info.access)}</span></div>` +
+        `<pre class="sql">${fillSql(ev.info, ev.args)}</pre></div>`);
+      break;
+    }
+    case "tool_result": {
+      const state = ev.ok ? "passed" : "error";
+      ["s-toolbox", "s-db", "e-tool", "e-db"].forEach((id) => lamp(id, state));
+      const card = $("tool-" + ev.id);
+      if (card) card.insertAdjacentHTML("beforeend", ev.ok
+        ? table(ev.result) + `<div class="result-note">${Array.isArray(ev.result) ? ev.result.length : 0} rows · ${ev.ms} ms</div>`
+        : `<div class="result-note err">${esc(ev.error)}</div>`);
+      break;
+    }
+    case "final": {
+      lamp("s-phoenix", "passed"); lamp("e-trace", "passed");
+      $("arch-state").textContent = ev.terminated;
+      finishBubble(ev.response, ev.terminated, ev);
+      $("timeline").insertAdjacentHTML("beforeend",
+        `<div class="summary"><span><b>${esc(ev.terminated)}</b>${ev.blocked ? " at " + esc(ev.blocked_at) : ""}</span>` +
+        `<span><b>${ev.wall_clock_ms}</b> ms</span><span><b>${ev.tokens.in}→${ev.tokens.out}</b> tok</span></div>`);
+      break;
+    }
+    case "error": {
+      const r = $("row-" + ev.step);
+      if (r) { r.className = "row error"; r.querySelector(".ms").textContent = "error";
+               r.insertAdjacentHTML("beforeend", `<div class="d">${esc(ev.error)}</div>`); }
+      lamp("n-" + ev.step, "error"); (SERVICES[ev.step] || []).forEach((id) => lamp(id, "error"));
+      skipAfter(ev.step); lamp("s-phoenix", "passed");
+      $("arch-state").textContent = "error";
+      finishBubble(ev.error, "error", null);
+      break;
+    }
+  }
+}
+function agentList() {
+  const r = $("row-agent");
+  let list = r.querySelector(".sub-list");
+  if (!list) { list = document.createElement("div"); list.className = "sub-list"; r.appendChild(list); }
+  return list;
+}
+
+/* ── chat ───────────────────────────────────────────── */
+function addMsg(cls, html) {
+  $("empty")?.remove();
+  const el = document.createElement("div");
+  el.className = "msg " + cls; el.innerHTML = html;
+  $("log").appendChild(el); $("log").scrollTop = $("log").scrollHeight;
+  return el;
+}
+function finishBubble(text, terminated, final) {
+  const kind = final?.blocked ? "blocked" : terminated === "error" ? "error" : terminated === "cap" ? "cap" : "";
+  bubble.className = "msg agent " + kind;
+  const trace = bubble.dataset.trace;
+  const badge = kind ? `<span class="badge ${kind}">${kind === "blocked" ? "blocked · " + esc(final.blocked_at) : esc(kind)}</span>` : "";
+  const stats = final ? `<span>${final.wall_clock_ms} ms</span><span>${final.tokens.in}→${final.tokens.out} tok</span>` : "";
+  bubble.innerHTML = `<div class="text">${esc(text)}</div><div class="meta">${badge}${stats}` +
+    (trace ? `<a href="${esc(trace)}" target="_blank" rel="noopener">trace ↗</a>` : "") + `</div>`;
+  $("log").scrollTop = $("log").scrollHeight;
+}
+
+async function send(message) {
+  if (busy || !message.trim()) return;
+  if (!user) { showLogin(); return; }
+  busy = true; $("send").disabled = true;
+  addMsg("user", esc(message));
+  bubble = addMsg("agent", `<span class="dots"><span></span><span></span><span></span></span>`);
+  try {
+    const r = await fetch("/api/chat", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ user_id: user.user_id, message }) });
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      finishBubble(body.error || `Request failed (${r.status}).`, "error", null);
+      if (r.status === 401) { setUser(null); showLogin("Your session ended. Please sign in again."); }
+      return;
+    }
+    // Read the NDJSON stream line by line, so each step appears as it happens (W-3).
+    const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+        if (line) onEvent(JSON.parse(line));
+      }
+    }
+  } catch (err) {
+    finishBubble(`Connection lost: ${err.message}`, "error", null);
+  } finally {
+    busy = false; $("send").disabled = false; $("message").focus();
+  }
+}
+$("composer").addEventListener("submit", (e) => { e.preventDefault(); const m = $("message").value; $("message").value = ""; send(m); });
+$("suggest").innerHTML = SUGGEST.map((s) => `<button type="button">${esc(s)}</button>`).join("");
+$("suggest").addEventListener("click", (e) => { if (e.target.tagName === "BUTTON") send(e.target.textContent); });
+
+/* ── boot ───────────────────────────────────────────── */
+loadHealth(); setInterval(loadHealth, 20000);
+try { const saved = JSON.parse(sessionStorage.getItem("desk-user") || "null"); if (saved) setUser(saved); } catch {}
+if (!user) showLogin(); else $("login").hidden = true;
+</script>
+</body>
+</html>
