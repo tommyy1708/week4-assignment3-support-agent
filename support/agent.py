@@ -5,10 +5,15 @@ import json
 import os
 
 from google.adk.agents import LlmAgent
+from google.adk.models.lite_llm import LiteLlm
 from toolbox_core import ToolboxClient
 
 TOOLBOX_URL = os.getenv("TOOLBOX_URL", "http://127.0.0.1:5001")
-MODEL = "gemini-3.8-flash"  # SPEC says 2.5 Flash; it is closed to new users as of 2026-10
+# SPEC's model, reached through OpenRouter (AI Studio closed 2.5 Flash to new users, and its
+# free tier allows 20 requests a day). LiteLLM reads OPENROUTER_API_KEY from the environment.
+MODEL = "openrouter/google/gemini-2.5-flash"
+# Tool parameters filled from the login session, never by the model (M-5).
+BOUND_PARAMS = ("customer_email", "user_email")
 
 INSTRUCTION = """\
 You are the customer support agent for an online electronics shop. You are talking to
@@ -45,11 +50,11 @@ async def build_agent(client: ToolboxClient, customer: dict) -> LlmAgent:
     email = customer["email"]
     tools = await client.load_toolset(
         "support-agent",
-        bound_params={"customer_email": email, "user_email": email},
+        bound_params={name: email for name in BOUND_PARAMS},
     )
     return LlmAgent(
         name="support_agent",
-        model=MODEL,
+        model=LiteLlm(model=MODEL),
         instruction=INSTRUCTION.format(full_name=customer["full_name"]),
         tools=tools,
     )

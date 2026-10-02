@@ -1,0 +1,200 @@
+"""One support turn as a stream of events (SPEC §7.1). The CLI and the web server only render
+this stream; no pipeline logic lives in either (P-1).
+
+Stage 4: the agent step only. Tracing, guards and memory are added in stages 5 to 8."""
+
+import asyncio
+import json
+import secrets
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, AsyncIterator
+
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.genai import types
+from toolbox_core import ToolboxClient
+
+from support.agent import MODEL, build_agent
+from support.tool_info import tool_info
+
+APP_NAME = "support_desk"
+RUNS_DIR = Path(__file__).resolve().parent.parent / "runs"
+
+# Per-turn budget (THRESHOLDS §6). Hitting one ends the turn with terminated: "cap" (P-6).
+T_BUD_TOOLS = 6
+T_BUD_TOKENS = 30_000
+T_BUD_WALL_S = 30
+
+
+@dataclass
+class SupportSession:
+    """One logged-in customer: their agent (email already bound) and ADK session."""
+    customer: dict
+    runner: Runner
+    session_id: str
+
+
+async def open_session(client: ToolboxClient, customer: dict) -> SupportSession:
+    agent = await build_agent(client, customer)
+    sessions = InMemorySessionService()
+    session = await sessions.create_session(app_name=APP_NAME, user_id=customer["email"])
+    runner = Runner(app_name=APP_NAME, agent=agent, session_service=sessions)
+    return SupportSession(customer, runner, session.id)
+
+
+class _Cap(Exception):
+    """A per-turn budget was hit; the argument names which one."""
+
+
+class _Turn:
+    """Everything the run log (EVALS §4.1) needs, collected while the turn runs."""
+
+    def __init__(self, user: str, message: str):
+        self.turn_id = f"turn_{time.strftime('%Y%m%dT%H%M%S')}_{secrets.token_hex(3)}"
+        self.user, self.message = user, message
+        self.t0 = time.monotonic()
+        self.steps: list[dict] = []
+        self.tool_calls: list[dict] = []
+        self.pending: dict[str, dict] = {}  # ADK call id -> tool_call event awaiting its result
+        self.llm_calls = 0
+        self.tokens = {"in": 0, "out": 0}
+
+    def ms(self) -> int:
+        return int((time.monotonic() - self.t0) * 1000)
+
+    def write_log(self, terminated: str, blocked_at: str | None = None) -> None:
+        RUNS_DIR.mkdir(exist_ok=True)
+        log = {
+            "turn_id": self.turn_id, "trace_id": None, "user": self.user, "message": self.message,
+            "terminated": terminated, "blocked_at": blocked_at, "wall_clock_ms": self.ms(),
+            "tokens": self.tokens, "steps": self.steps, "tool_calls": self.tool_calls,
+            "llm_calls": self.llm_calls,
+        }
+        (RUNS_DIR / f"{self.turn_id}.json").write_text(json.dumps(log, indent=2))
+
+
+async def run_turn(sess: SupportSession, message: str) -> AsyncIterator[dict]:
+    turn = _Turn(sess.customer["email"], message)
+    yield {"type": "trace", "turn_id": turn.turn_id, "trace_id": None, "url": None}  # stage 5
+
+    yield {"type": "stage", "key": "agent", "label": "Support agent"}
+    started = time.monotonic()
+    result: dict = {}
+    terminated, response = "done", ""
+    try:
+        async for event in _agent_events(sess, turn, message, result):
+            yield event
+        response = result.get("response", "")
+    except (_Cap, TimeoutError) as cap:
+        reason = str(cap) if isinstance(cap, _Cap) else "time"
+        terminated = "cap"
+        response = f"I had to stop here: this request went over the {reason} limit for one turn. Please try a simpler question."
+        for event in _cancel_pending(turn, f"turn hit the {reason} limit"):
+            yield event
+    except Exception as e:  # Fail loud: an agent failure is an error, never a quiet empty answer (P-4).
+        for event in _cancel_pending(turn, "turn failed"):
+            yield event
+        turn.write_log("error")
+        yield {"type": "error", "step": "agent", "status": 502,
+               "error": f"{type(e).__name__}: {e}", "terminated": "error"}
+        return
+
+    ms = int((time.monotonic() - started) * 1000)
+    turn.steps.append({"key": "agent", "status": "passed", "ms": ms})
+    yield {"type": "step", "key": "agent", "status": "passed",
+           "detail": f"{turn.llm_calls} model calls, {len(turn.tool_calls)} tool calls",
+           "ms": ms, "span": "invoke_agent support_agent", "kind": "in-process"}
+
+    turn.write_log(terminated)  # before the terminal event (P-5)
+    yield {"type": "final", "blocked": False, "blocked_at": None, "response": response,
+           "terminated": terminated, "wall_clock_ms": turn.ms(), "tokens": turn.tokens}
+
+
+async def _agent_events(sess: SupportSession, turn: _Turn, message: str, result: dict) -> AsyncIterator[dict]:
+    """Translate ADK's events into llm / tool_call / tool_result events, enforcing the budget."""
+    content = types.Content(role="user", parts=[types.Part(text=message)])
+    agen = sess.runner.run_async(user_id=sess.customer["email"], session_id=sess.session_id,
+                                 new_message=content)
+    mark = time.monotonic()  # when the current model call started
+    try:
+        async with asyncio.timeout(max(0.0, T_BUD_WALL_S - turn.ms() / 1000)):
+            async for ev in agen:
+                calls = ev.get_function_calls()
+                if ev.usage_metadata is not None:  # a model response
+                    u = ev.usage_metadata
+                    tokens_in = u.prompt_token_count or 0
+                    tokens_out = (u.candidates_token_count or 0) + (u.thoughts_token_count or 0)
+                    turn.llm_calls += 1
+                    turn.tokens["in"] += tokens_in
+                    turn.tokens["out"] += tokens_out
+                    yield {"type": "llm", "model": MODEL,
+                           "decision": "call " + ", ".join(c.name for c in calls) if calls else "final answer",
+                           "tokens_in": tokens_in, "tokens_out": tokens_out,
+                           "ms": int((time.monotonic() - mark) * 1000), "span": "call_llm"}
+                    if turn.tokens["in"] + turn.tokens["out"] > T_BUD_TOKENS:
+                        raise _Cap("token")
+
+                if len(turn.tool_calls) + len(turn.pending) + len(calls) > T_BUD_TOOLS:
+                    raise _Cap("tool call")
+                for call in calls:
+                    event = {"type": "tool_call", "id": len(turn.tool_calls) + len(turn.pending) + 1,
+                             "name": call.name, "args": _decode_args(call.args or {}),
+                             "info": tool_info(call.name), "span": f"execute_tool {call.name}",
+                             "_t": time.monotonic()}
+                    turn.pending[call.id] = event
+                    yield {k: v for k, v in event.items() if k != "_t"}
+
+                for resp in ev.get_function_responses():
+                    call_event = turn.pending.pop(resp.id)
+                    ms = int((time.monotonic() - call_event["_t"]) * 1000)
+                    ok, rows, error = _decode_result(resp.response or {})
+                    turn.tool_calls.append({"name": resp.name, "ok": ok, "ms": ms} | ({} if ok else {"error": error}))
+                    yield {"type": "tool_result", "id": call_event["id"], "name": resp.name, "ok": ok,
+                           "ms": ms} | ({"result": rows} if ok else {"error": error})
+                    mark = time.monotonic()
+
+                if ev.is_final_response() and ev.content and ev.content.parts:
+                    result["response"] = "".join(p.text or "" for p in ev.content.parts if not p.thought)
+    finally:
+        await agen.aclose()
+
+
+def _cancel_pending(turn: _Turn, reason: str) -> list[dict]:
+    """Close every tool_call still waiting, so each has exactly one tool_result (SPEC §7.3 rule 3)."""
+    events = []
+    for call_event in turn.pending.values():
+        turn.tool_calls.append({"name": call_event["name"], "ok": False, "ms": 0, "error": reason})
+        events.append({"type": "tool_result", "id": call_event["id"], "name": call_event["name"],
+                       "ok": False, "ms": 0, "error": reason})
+    turn.pending.clear()
+    return events
+
+
+def _decode_args(args: dict) -> dict:
+    """The model sends action-log's parameters as a JSON string; emit it as an object (SPEC §7.1)."""
+    decoded = {}
+    for key, value in args.items():
+        if isinstance(value, str) and value.strip()[:1] in ("{", "["):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                pass
+        decoded[key] = value
+    return decoded
+
+
+def _decode_result(response: dict) -> tuple[bool, list | Any, str | None]:
+    """Unwrap the Toolbox's {"result": "<JSON string>"} into rows; surface errors as errors."""
+    if "error" in response:
+        return False, None, str(response["error"])
+    raw = response.get("result")
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return True, raw, None
+    if isinstance(data, dict) and "error" in data:
+        return False, None, str(data["error"])
+    rows = [] if data is None else data if isinstance(data, list) else [data]
+    return True, rows, None

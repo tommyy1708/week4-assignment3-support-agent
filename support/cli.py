@@ -1,50 +1,106 @@
-"""Bare CLI for stage 3: log in, then chat with the support agent. Stage 4 replaces the loop
-body with the pipeline's event stream."""
+"""CLI front end: log in, then render the pipeline's events as they arrive, one readable
+line per step (C-1, C-2). --events prints the raw stream as NDJSON and nothing else (C-3).
 
+    python -m support.cli
+    echo "What is the status of order 3?" | python -m support.cli --user alice.jones@example.com --events
+
+The password is read with hidden input, or from SUPPORT_PASSWORD when there is no terminal."""
+
+import argparse
 import asyncio
 import getpass
+import json
+import logging
+import os
+import sys
+import warnings
 
 from dotenv import load_dotenv
-from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
-from google.genai import types
 from toolbox_core import ToolboxClient
 
-from support.agent import TOOLBOX_URL, build_agent, login
+from support.agent import TOOLBOX_URL, login
+from support.pipeline import open_session, run_turn
 
-APP_NAME = "support_desk"
+QUIT = {"quit", "exit", "q"}
+
+
+def render(ev: dict) -> None:
+    """Tree-style lines: ✓/✗ for steps, ◆ for model calls, ⚙ for tools, └ for detail."""
+    kind = ev["type"]
+    if kind == "trace":
+        print(f"── {ev['turn_id']}")
+    elif kind == "step":
+        mark, status = ("✓", "") if ev["status"] == "passed" else ("✗", "  BLOCKED")
+        print(f"{mark} {ev['key']}{status}  {ev['ms']} ms")
+        if ev.get("detail"):
+            print(f"  └ {ev['detail']}")
+    elif kind == "llm":
+        print(f"◆ llm  {ev['decision']}  {ev['ms']} ms · {ev['tokens_in']}→{ev['tokens_out']} tok")
+    elif kind == "tool_call":
+        args = ", ".join(f"{k}={json.dumps(v) if isinstance(v, (dict, list)) else v}" for k, v in ev["args"].items())
+        bound = ", ".join(ev["info"]["bound"])
+        print(f"⚙ {ev['name']}  {args}" + (f"  [bound: {bound}]" if bound else ""))
+    elif kind == "tool_result":
+        if not ev["ok"]:
+            print(f"  └ ERROR {ev['error']}  {ev['ms']} ms")
+            return
+        rows = ev["result"]
+        summary = f"{len(rows)} row" + ("" if len(rows) == 1 else "s")
+        if rows and isinstance(rows[0], dict):
+            first = {k: rows[0][k] for k in ("order_id", "status", "id", "action_type") if k in rows[0]}
+            summary += f": {first}" + (" …" if len(rows) > 1 else "")
+        print(f"  └ {summary}  {ev['ms']} ms")
+    elif kind == "final":
+        print(f"Agent: {ev['response']}")
+        print(f"  {ev['terminated']} · {ev['wall_clock_ms']} ms · {ev['tokens']['in']}→{ev['tokens']['out']} tok")
+    elif kind == "error":
+        print(f"✗ {ev['step']}  ERROR  {ev['error']}")
 
 
 async def main() -> None:
-    load_dotenv()
-    async with ToolboxClient(TOOLBOX_URL) as client:
-        email = input("Email: ").strip()
-        customer = await login(client, email, getpass.getpass("Password: "))
-        if customer is None:
-            print("Invalid email or password.")
-            return
-        print(f"Logged in as {customer['full_name']}. Type quit to leave.")
+    parser = argparse.ArgumentParser(description="Support desk CLI")
+    parser.add_argument("--user", help="log in as this email instead of prompting")
+    parser.add_argument("--events", action="store_true", help="print raw NDJSON events only")
+    args = parser.parse_args()
 
-        agent = await build_agent(client, customer)
-        sessions = InMemorySessionService()
-        session = await sessions.create_session(app_name=APP_NAME, user_id=customer["email"])
-        runner = Runner(app_name=APP_NAME, agent=agent, session_service=sessions)
+    load_dotenv()
+    logging.getLogger("google_adk").setLevel(logging.CRITICAL)  # failures surface as error events
+    warnings.filterwarnings("ignore", message=r"\[EXPERIMENTAL\]")
+    say = (lambda text: print(text, file=sys.stderr)) if args.events else print
+
+    async with ToolboxClient(TOOLBOX_URL) as client:
+        if args.user:
+            email = args.user
+        elif args.events:  # keep stdout pure NDJSON
+            sys.stderr.write("Email: ")
+            email = sys.stdin.readline().strip()
+        else:
+            email = input("Email: ").strip()
+        password = os.environ.get("SUPPORT_PASSWORD") or getpass.getpass("Password: ")
+        customer = await login(client, email, password)
+        if customer is None:
+            say("Invalid email or password.")
+            sys.exit(1)
+        say(f"Logged in as {customer['full_name']}. Type quit to leave.")
+        sess = await open_session(client, customer)
 
         while True:
-            message = input("You: ").strip()
-            if message.lower() in {"quit", "exit", "q"}:
+            try:
+                message = sys.stdin.readline() if args.events else input("You: ")
+            except EOFError:
+                break
+            if args.events and message == "":
+                break
+            message = message.strip()
+            if message.lower() in QUIT:
                 break
             if not message:
                 continue
-            content = types.Content(role="user", parts=[types.Part(text=message)])
-            try:
-                async for event in runner.run_async(
-                    user_id=customer["email"], session_id=session.id, new_message=content
-                ):
-                    if event.is_final_response() and event.content and event.content.parts:
-                        print("Agent:", "".join(p.text or "" for p in event.content.parts))
-            except Exception as e:  # say what failed and keep the session; never pretend to answer
-                print(f"Error: {type(e).__name__}: {e}")
+            async for ev in run_turn(sess, message):
+                if args.events:
+                    print(json.dumps(ev, ensure_ascii=False), flush=True)
+                else:
+                    render(ev)
 
 
 if __name__ == "__main__":
