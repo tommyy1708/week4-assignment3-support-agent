@@ -1,7 +1,8 @@
 """One support turn as a stream of events (SPEC §7.1). The CLI and the web server only render
 this stream; no pipeline logic lives in either (P-1).
 
-Stage 4: the agent step only. Tracing, guards and memory are added in stages 5 to 8."""
+Each turn runs inside one root span, agent.turn (O-2). Stage 5: the agent step only; guards and
+memory are added in stages 6 to 8."""
 
 import asyncio
 import json
@@ -14,9 +15,13 @@ from typing import Any, AsyncIterator
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
+from openinference.semconv.trace import OpenInferenceSpanKindValues, SpanAttributes
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
 from toolbox_core import ToolboxClient
 
 from support.agent import MODEL, build_agent
+from support.telemetry import trace_url
 from support.tool_info import tool_info
 
 APP_NAME = "support_desk"
@@ -26,6 +31,8 @@ RUNS_DIR = Path(__file__).resolve().parent.parent / "runs"
 T_BUD_TOOLS = 6
 T_BUD_TOKENS = 30_000
 T_BUD_WALL_S = 30
+
+_tracer = trace.get_tracer("support.pipeline")
 
 
 @dataclass
@@ -53,6 +60,7 @@ class _Turn:
 
     def __init__(self, user: str, message: str):
         self.turn_id = f"turn_{time.strftime('%Y%m%dT%H%M%S')}_{secrets.token_hex(3)}"
+        self.trace_id: str | None = None
         self.user, self.message = user, message
         self.t0 = time.monotonic()
         self.steps: list[dict] = []
@@ -67,7 +75,7 @@ class _Turn:
     def write_log(self, terminated: str, blocked_at: str | None = None) -> None:
         RUNS_DIR.mkdir(exist_ok=True)
         log = {
-            "turn_id": self.turn_id, "trace_id": None, "user": self.user, "message": self.message,
+            "turn_id": self.turn_id, "trace_id": self.trace_id, "user": self.user, "message": self.message,
             "terminated": terminated, "blocked_at": blocked_at, "wall_clock_ms": self.ms(),
             "tokens": self.tokens, "steps": self.steps, "tool_calls": self.tool_calls,
             "llm_calls": self.llm_calls,
@@ -76,8 +84,29 @@ class _Turn:
 
 
 async def run_turn(sess: SupportSession, message: str) -> AsyncIterator[dict]:
+    """Run one turn inside its agent.turn span. ADK runs in this same task and context, so its
+    invoke_agent span becomes a child of agent.turn instead of a second root (T-TRACE-ONE)."""
     turn = _Turn(sess.customer["email"], message)
-    yield {"type": "trace", "turn_id": turn.turn_id, "trace_id": None, "url": None}  # stage 5
+    attributes = {
+        SpanAttributes.OPENINFERENCE_SPAN_KIND: OpenInferenceSpanKindValues.CHAIN.value,
+        SpanAttributes.INPUT_VALUE: message,
+        SpanAttributes.USER_ID: turn.user,
+        "turn.id": turn.turn_id,
+    }
+    with _tracer.start_as_current_span("agent.turn", attributes=attributes) as span:
+        turn.trace_id = format(span.get_span_context().trace_id, "032x")
+        async for event in _turn_events(sess, turn, message):
+            if event["type"] == "final":
+                span.set_attribute(SpanAttributes.OUTPUT_VALUE, event["response"])
+                span.set_attribute("turn.terminated", event["terminated"])
+            elif event["type"] == "error":
+                span.set_status(Status(StatusCode.ERROR, event["error"]))
+                span.set_attribute("turn.terminated", "error")
+            yield event
+
+
+async def _turn_events(sess: SupportSession, turn: _Turn, message: str) -> AsyncIterator[dict]:
+    yield {"type": "trace", "turn_id": turn.turn_id, "trace_id": turn.trace_id, "url": trace_url(turn.trace_id)}
 
     yield {"type": "stage", "key": "agent", "label": "Support agent"}
     started = time.monotonic()
@@ -94,6 +123,7 @@ async def run_turn(sess: SupportSession, message: str) -> AsyncIterator[dict]:
         for event in _cancel_pending(turn, f"turn hit the {reason} limit"):
             yield event
     except Exception as e:  # Fail loud: an agent failure is an error, never a quiet empty answer (P-4).
+        trace.get_current_span().record_exception(e)
         for event in _cancel_pending(turn, "turn failed"):
             yield event
         turn.write_log("error")

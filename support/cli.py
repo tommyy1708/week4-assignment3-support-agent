@@ -20,14 +20,20 @@ from toolbox_core import ToolboxClient
 
 from support.agent import TOOLBOX_URL, login
 from support.pipeline import open_session, run_turn
+from support.telemetry import flush, setup_tracing
 
 QUIT = {"quit", "exit", "q"}
 
 
+_trace_url = ""
+
+
 def render(ev: dict) -> None:
     """Tree-style lines: ✓/✗ for steps, ◆ for model calls, ⚙ for tools, └ for detail."""
+    global _trace_url
     kind = ev["type"]
     if kind == "trace":
+        _trace_url = ev["url"]
         print(f"── {ev['turn_id']}")
     elif kind == "step":
         mark, status = ("✓", "") if ev["status"] == "passed" else ("✗", "  BLOCKED")
@@ -53,8 +59,10 @@ def render(ev: dict) -> None:
     elif kind == "final":
         print(f"Agent: {ev['response']}")
         print(f"  {ev['terminated']} · {ev['wall_clock_ms']} ms · {ev['tokens']['in']}→{ev['tokens']['out']} tok")
+        print(f"  trace: {_trace_url}")
     elif kind == "error":
         print(f"✗ {ev['step']}  ERROR  {ev['error']}")
+        print(f"  trace: {_trace_url}")
 
 
 async def main() -> None:
@@ -67,6 +75,11 @@ async def main() -> None:
     logging.getLogger("google_adk").setLevel(logging.CRITICAL)  # failures surface as error events
     warnings.filterwarnings("ignore", message=r"\[EXPERIMENTAL\]")
     say = (lambda text: print(text, file=sys.stderr)) if args.events else print
+    try:
+        setup_tracing()  # before any agent is built, so ADK's spans reach Phoenix
+    except RuntimeError as e:
+        say(str(e))
+        sys.exit(1)
 
     async with ToolboxClient(TOOLBOX_URL) as client:
         if args.user:
@@ -101,6 +114,7 @@ async def main() -> None:
                     print(json.dumps(ev, ensure_ascii=False), flush=True)
                 else:
                     render(ev)
+            flush()  # export now, so the printed trace URL opens straight away
 
 
 if __name__ == "__main__":
