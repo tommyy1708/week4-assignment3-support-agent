@@ -76,7 +76,8 @@ async def check(message: str) -> tuple[Decision, int, int]:
         async for ev in _get_runner().run_async(user_id=_USER, session_id=session.id, new_message=content):
             if ev.usage_metadata is not None:
                 tokens_in += ev.usage_metadata.prompt_token_count or 0
-                tokens_out += (ev.usage_metadata.candidates_token_count or 0) + (ev.usage_metadata.thoughts_token_count or 0)
+                usage = ev.usage_metadata
+                tokens_out += (usage.candidates_token_count or 0) + (usage.thoughts_token_count or 0)
             if ev.is_final_response() and ev.content and ev.content.parts:
                 text = "".join(p.text or "" for p in ev.content.parts if not p.thought)
     finally:

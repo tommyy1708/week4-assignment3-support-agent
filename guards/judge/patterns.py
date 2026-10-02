@@ -30,7 +30,8 @@ PATTERNS: list[tuple[str, re.Pattern]] = [
     ("shell: rm -rf", re.compile(r"\brm\s+-rf\b", _I)),
     ("path traversal", re.compile(r"\.\./|/etc/(passwd|shadow)\b", _I)),
     # Prompt injection and extraction
-    ("prompt: ignore previous", re.compile(r"\bignore\s+(all\s+)?(the\s+|your\s+)?(previous|prior|above|earlier)\b", _I)),
+    ("prompt: ignore previous",
+     re.compile(r"\bignore\s+(all\s+)?(the\s+|your\s+)?(previous|prior|above|earlier)\b", _I)),
     ("prompt: forget rules", re.compile(r"\bforget\s+(all\s+)?(your|the)\s+(rules|instructions)\b", _I)),
     ("prompt: role override", re.compile(r"\byou\s+are\s+now\b|^\s*system\s*:", _I)),
     ("prompt: new instructions", re.compile(r"#{2,}\s*(new\s+)?instructions\b", _I)),

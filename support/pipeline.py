@@ -231,7 +231,8 @@ async def _turn_events(sess: SupportSession, turn: _Turn, message: str) -> Async
     except (_Cap, TimeoutError) as cap:
         reason = str(cap) if isinstance(cap, _Cap) else "time"
         terminated = "cap"
-        response = f"I had to stop here: this request went over the {reason} limit for one turn. Please try a simpler question."
+        response = (f"I had to stop here: this request went over the {reason} limit for one turn. "
+                    "Please try a simpler question.")
         for event in _cancel_pending(turn, f"turn hit the {reason} limit"):
             yield event
     except Exception as e:  # Fail loud: an agent failure is an error, never a quiet empty answer (P-4).

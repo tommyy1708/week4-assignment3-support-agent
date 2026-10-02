@@ -1,0 +1,16 @@
+[project]
+name = "support-desk"
+version = "0.1.0"
+description = "Assignment 3: a multi-agent customer support desk (ADK, MCP Toolbox, A2A, Mem0, Phoenix)"
+requires-python = ">=3.12"
+
+# Gate 0 (EVALS §5): this is the linter configuration the gate runs.
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = [".venv", "phoenix_data", "runs", "reports", "logs"]
+
+[tool.ruff.lint]
+# Errors, pyflakes, warnings, import order. Broad `except Exception` is deliberate in the
+# pipeline: any failure becomes an error event, never a pass (P-4), so BLE is not enabled.
+select = ["E", "F", "W", "I"]
