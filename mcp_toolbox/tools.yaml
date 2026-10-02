@@ -1,0 +1,90 @@
+# MCP Toolbox config: the only way anything reaches the database (M-2).
+# Ownership lives in the SQL: every statement filters on the customer's email (M-4).
+# In stage 3 that email is bound from the login session, so the model never chooses it (M-5).
+kind: source
+name: shop-db
+type: postgres
+host: 127.0.0.1
+port: 5434
+database: shop
+user: toolbox
+password: ${TOOLBOX_DB_PASSWORD}
+---
+kind: tool
+name: get-order-status
+type: postgres-sql
+source: shop-db
+description: >-
+  Look up one of the logged-in customer's orders by its order number. Returns the
+  order's status, items, date, total and delivery address. Returns nothing if the
+  order does not exist or belongs to someone else; treat both as "not found on your account".
+parameters:
+  - name: order_id
+    type: integer
+    description: The order number the customer is asking about.
+  - name: customer_email
+    type: string
+    description: The logged-in customer's email. Set by the system from the session.
+statement: |
+  SELECT order_id, customer_email, status, items, order_date, total_amount, delivery_address
+  FROM customer_orders
+  WHERE order_id = $1 AND customer_email = $2;
+---
+kind: tool
+name: find-customer-orders
+type: postgres-sql
+source: shop-db
+description: >-
+  List all of the logged-in customer's orders, newest first. Use it for order history,
+  "my last order", or to find an order the customer describes by product instead of number.
+parameters:
+  - name: customer_email
+    type: string
+    description: The logged-in customer's email. Set by the system from the session.
+statement: |
+  SELECT order_id, customer_email, status, items, order_date, total_amount, delivery_address
+  FROM customer_orders
+  WHERE customer_email = $1
+  ORDER BY order_date DESC;
+---
+kind: tool
+name: action-log
+type: postgres-sql
+source: shop-db
+description: >-
+  Record a change the customer asked for, so a person can act on it later. This does
+  NOT change the order. Returns the logged row on success. Returns nothing if the
+  order_id does not belong to this customer: tell them it isn't on their account.
+parameters:
+  - name: user_email
+    type: string
+    description: The logged-in customer's email. Set by the system from the session.
+  - name: action_type
+    type: string
+    description: >-
+      Exactly one of CANCEL_ORDER, RETURN_ORDER, UPDATE_ADDRESS, UPDATE_PREFERENCE,
+      UPDATE_PROFILE. No other value is accepted.
+  - name: parameters
+    type: string
+    description: >-
+      A JSON object with the details, e.g. {"order_id": 4, "reason": "found it cheaper"}.
+      Include "order_id" whenever the request is about a specific order.
+# Ownership check and insert in one statement (M-8): an order_id the user doesn't own inserts 0 rows.
+statement: |
+  INSERT INTO actions_log (user_email, action_type, parameters)
+  SELECT $1::text, $2::text, $3::jsonb
+  WHERE ($3::jsonb ->> 'order_id') IS NULL
+     OR EXISTS (
+       SELECT 1 FROM customer_orders o
+       WHERE o.order_id = ($3::jsonb ->> 'order_id')::int
+         AND o.customer_email = $1::text
+     )
+  RETURNING id, action_type, parameters;
+---
+# The only toolset the support agent loads. No tool here can modify customer_orders (M-6).
+kind: toolset
+name: support-agent
+tools:
+  - get-order-status
+  - find-customer-orders
+  - action-log

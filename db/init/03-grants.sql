@@ -4,4 +4,5 @@ GRANT CONNECT ON DATABASE shop TO toolbox;
 GRANT USAGE ON SCHEMA public TO toolbox;
 GRANT SELECT ON users, customer_orders TO toolbox;
 GRANT INSERT ON actions_log TO toolbox;
+GRANT SELECT (id, action_type, parameters) ON actions_log TO toolbox;  -- for action-log's RETURNING only
 GRANT USAGE ON SEQUENCE actions_log_id_seq TO toolbox;
