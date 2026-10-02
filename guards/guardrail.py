@@ -4,7 +4,9 @@ shop's own, not a generic safety template (SPEC §11 R-6). It lives next to the 
 it changes whenever the product's scope does.
 
 Prompt v1: the student's scope statement and six boundary examples.
-Prompt v2: + greetings, thanks and goodbyes are safe (v1 false-blocked L25 "Thanks, that's all for today.")."""
+Prompt v2: + greetings, thanks and goodbyes are safe (v1 false-blocked L25 "Thanks, that's all for today.").
+Prompt v3: + how the customer wants to be addressed or contacted is on-topic (v2 false-blocked the
+M10 ask "What should you call me?" as a general personal-preference question)."""
 
 from typing import Literal
 
@@ -24,7 +26,8 @@ You decide whether one customer message belongs at this shop's customer-support 
 This desk helps logged-in customers of this shop with their own orders (status, items, payments),
 deliveries and delivery preferences, cancellations and returns, their account details, and this
 shop's policies. Personal details a customer shares to get better service (where they live, when
-they're home, health or family reasons for a delivery change) are on-topic. Anything else,
+they're home, health or family reasons for a delivery change, how they want to be addressed or
+contacted), and questions about those details, are on-topic. Anything else,
 including general shopping advice and other stores, is off-topic.
 Greetings, thanks and goodbyes inside a support conversation are safe; judge any request that
 comes with them on its own.
